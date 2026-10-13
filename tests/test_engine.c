@@ -143,20 +143,82 @@ int main(void)
     check(!ok_code(r), "error op surfaces message");
     json_free(r);
 
-    /* --- persistence round-trip --- */
+    /* ================= Phase 3: WAL durability & crash recovery =========== */
     const char *tmp = "/tmp/isql_test.json";
-    db.filename = strdup(tmp);
-    check(db_save(&db) == NULL, "save ok");
-
-    Database db2;
-    db_init(&db2, tmp);
-    check(db_load(&db2) == NULL, "load ok");
-    r = run(&db2, "{\"op\":\"select\",\"table\":\"users\"}");
-    check(ok_code(r) && rows_of_result(r) == 3, "reloaded db has 3 rows");
-    JsonValue *schema = json_parse(db_schema_prompt(&db2));
-    (void)schema;
-    json_free(r);
     remove(tmp);
+    remove("/tmp/isql_test.json.wal");
+    db.filename = strdup(tmp);
+
+    /* snapshot of current state (3 users), then attach the WAL */
+    check(db_save(&db) == NULL, "snapshot save ok");
+    check(db_attach_wal(&db) == NULL, "wal attach ok");
+
+    /* mutation goes to the WAL only (no snapshot rewrite) */
+    r = run(&db, "{\"op\":\"insert\",\"table\":\"users\",\"values\":{\"name\":\"walman\",\"age\":99}}");
+    check(ok_code(r), "insert with wal ok");
+    json_free(r);
+
+    /* --- simulated crash: fresh process loads snapshot + replays WAL --- */
+    Database db3;
+    db_init(&db3, tmp);
+    check(db_load(&db3) == NULL, "crash: snapshot loads");
+    check(db_attach_wal(&db3) == NULL, "crash: wal replays");
+    r = run(&db3, "{\"op\":\"select\",\"table\":\"users\"}");
+    check(ok_code(r) && rows_of_result(r) == 4, "crash recovery: 4 users (3 snapshot + 1 wal)");
+    json_free(r);
+    r = run(&db3, "{\"op\":\"select\",\"table\":\"users\",\"where\":{\"name\":\"walman\"}}");
+    check(ok_code(r) && rows_of_result(r) == 1, "crash recovery: walman present after replay");
+    json_free(r);
+
+    /* --- rollback: a failed batch must NOT leave wal entries behind --- */
+    r = run(&db, "{\"ops\":[{\"op\":\"insert\",\"table\":\"users\",\"values\":{\"name\":\"txn1\",\"age\":1}},"
+                   "{\"op\":\"insert\",\"table\":\"users\",\"values\":{\"name\":\"txn2\",\"age\":2,\"id\":14}}]}"); /* id 14 = walman, duplicate */
+    check(!ok_code(r), "failing batch rejected");
+    json_free(r);
+    r = run(&db, "{\"op\":\"create_table\",\"table\":\"probe\",\"columns\":[{\"name\":\"x\",\"type\":\"int\"}]}");
+    json_free(r);
+    r = run(&db, "{\"op\":\"select\",\"table\":\"users\"}");
+    check(ok_code(r) && rows_of_result(r) == 4, "in-memory rollback: still 4 users");
+    json_free(r);
+
+    /* --- successful batch IS durable in the wal --- */
+    r = run(&db, "{\"ops\":[{\"op\":\"insert\",\"table\":\"users\",\"values\":{\"name\":\"x1\",\"age\":1}},"
+                   "{\"op\":\"insert\",\"table\":\"users\",\"values\":{\"name\":\"x2\",\"age\":2}}]}");
+    check(ok_code(r), "successful batch ok");
+    json_free(r);
+    r = run(&db, "{\"op\":\"drop_table\",\"table\":\"probe\"}");
+    json_free(r);
+
+    /* --- second crash: txn1 must be gone, x1/x2 present --- */
+    Database db4;
+    db_init(&db4, tmp);
+    check(db_load(&db4) == NULL, "crash2: snapshot loads");
+    check(db_attach_wal(&db4) == NULL, "crash2: wal replays");
+    r = run(&db4, "{\"op\":\"select\",\"table\":\"users\"}");
+    check(ok_code(r) && rows_of_result(r) == 6, "crash2: 6 users (4 + batch of 2)");
+    json_free(r);
+    r = run(&db4, "{\"op\":\"select\",\"table\":\"users\",\"where\":{\"name\":\"txn1\"}}");
+    check(ok_code(r) && rows_of_result(r) == 0, "crash2: rolled-back txn1 never persisted");
+    json_free(r);
+    r = run(&db4, "{\"op\":\"select\",\"table\":\"users\",\"where\":{\"name\":\"x2\"}}");
+    check(ok_code(r) && rows_of_result(r) == 1, "crash2: committed x2 survives");
+    json_free(r);
+    r = run(&db4, "{\"op\":\"select\",\"table\":\"probe\"}");
+    check(!ok_code(r), "crash2: drop_table replayed (probe gone)");
+    json_free(r);
+
+    /* --- checkpoint truncates the log: restart replays nothing new --- */
+    check(db_checkpoint(&db4) == NULL, "checkpoint ok");
+    Database db5;
+    db_init(&db5, tmp);
+    check(db_load(&db5) == NULL, "after checkpoint: snapshot loads");
+    check(db_attach_wal(&db5) == NULL, "after checkpoint: wal attaches");
+    r = run(&db5, "{\"op\":\"select\",\"table\":\"users\"}");
+    check(ok_code(r) && rows_of_result(r) == 6, "after checkpoint: still 6 users");
+    json_free(r);
+
+    remove(tmp);
+    remove("/tmp/isql_test.json.wal");
 
 
     /* ================= Phase 2: operators, JOIN, aggregate, ALTER, batch ===== */

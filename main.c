@@ -14,6 +14,7 @@
 #include "db.h"
 #include "json.h"
 #include "llm.h"
+#include "wal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +24,10 @@
 #define MAX_STMT (8 * MAX_LINE)
 
 static Database db;
+
+/* explicit BEGIN/COMMIT/ROLLBACK transactions */
+static int txn_active = 0;
+static JsonValue *txn_snap = NULL;
 
 static const char *LLM_RULES =
     "You are the SQL parsing engine inside a tiny embedded database (a simplified SQLite).\n"
@@ -360,7 +365,8 @@ static void run_statement(const char *stmt)
 
     res = db_exec(&db, plan);
     print_result(res);
-    if (res_is_ok(res)) {
+    if (res_is_ok(res) && !db.wal) {
+        /* no WAL (disabled or could not attach): fall back to a full snapshot */
         const char *err = db_save(&db);
         if (err) printf("WARNING: cannot save: %s\n", err);
     }
@@ -386,8 +392,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "isql: %s\n", lerr);
         return 1;
     }
+    if (getenv("ISQL_WAL") && strcmp(getenv("ISQL_WAL"), "0") == 0) {
+        fprintf(stderr, "isql: WAL disabled by ISQL_WAL=0\n");
+    } else {
+        const char *werr = db_attach_wal(&db);
+        if (werr) fprintf(stderr, "isql: %s\n", werr);
+    }
 
-    printf("isql 0.2 - AI-driven minimal database\n"
+    printf("isql 0.3 - AI-driven minimal database\n"
            "  base : %s\n  model: %s\n  db   : %s\n"
            "  type 'help' for usage, 'exit' to quit\n\n",
            getenv("ISQL_BASE") ? getenv("ISQL_BASE") : "https://api.openai.com/v1",
@@ -416,6 +428,36 @@ int main(int argc, char **argv)
         if (!stmt) {
             if (strcmp(t, "help") == 0 || strcmp(t, "?") == 0) { print_help(); continue; }
             if (strcmp(t, "exit") == 0 || strcmp(t, "quit") == 0) break;
+            if (strcmp(t, "begin") == 0) {
+                if (txn_active) { printf("transaction already active\n"); continue; }
+                txn_snap = json_clone(db.tables);
+                if (db.wal) wal_begin(db.wal);
+                txn_active = 1;
+                printf("BEGIN\n");
+                continue;
+            }
+            if (strcmp(t, "commit") == 0) {
+                if (!txn_active) { printf("no transaction in progress\n"); continue; }
+                if (db.wal) {
+                    const char *ce = wal_commit(db.wal);
+                    if (ce) { printf("ERROR: %s\n", ce); continue; }
+                }
+                json_free(txn_snap);
+                txn_snap = NULL;
+                txn_active = 0;
+                printf("COMMIT\n");
+                continue;
+            }
+            if (strcmp(t, "rollback") == 0) {
+                if (!txn_active) { printf("no transaction in progress\n"); continue; }
+                json_free(db.tables); /* mutated tree; snapshot is a deep clone */
+                db.tables = txn_snap;
+                if (db.wal) wal_rollback(db.wal);
+                txn_snap = NULL;
+                txn_active = 0;
+                printf("ROLLBACK\n");
+                continue;
+            }
         }
         /* append to statement */
         if (stmt == NULL)
@@ -440,8 +482,14 @@ int main(int argc, char **argv)
         }
     }
     if (stmt) { free(stmt); stmt = NULL; }
+    if (txn_active) {
+        /* an open transaction at exit is rolled back */
+        wal_rollback(db.wal);
+        txn_active = 0;
+        fprintf(stderr, "isql: open transaction discarded on exit\n");
+    }
 
-    const char *serr = db_save(&db);
+    const char *serr = db_checkpoint(&db);
     if (serr) fprintf(stderr, "isql: save failed: %s\n", serr);
     return 0;
 }

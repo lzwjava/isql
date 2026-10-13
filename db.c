@@ -7,6 +7,7 @@
  * Queries arrive as JSON plans produced by the LLM parser (db_exec below).
  */
 #include "db.h"
+#include "wal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -307,6 +308,10 @@ static const JsonValue *pk_conflict(const JsonValue *tbl, const char *cname, Jso
 /* operations                                                        */
 /* ================================================================ */
 
+/* forward declarations: WAL helpers are implemented with the persistence code */
+static const char *db_log(Database *db, JsonValue *effect);
+const char *db_checkpoint(Database *db);
+
 static JsonValue *op_create_table(Database *db, JsonValue *op)
 {
     JsonValue *nv = json_obj_get(op, "table");
@@ -350,6 +355,12 @@ static JsonValue *op_create_table(Database *db, JsonValue *op)
     json_obj_set(tbl, "rows", json_arr());
     json_arr_push(db->tables, tbl);
 
+    JsonValue *eff = json_obj();
+    json_obj_set(eff, "k", json_str("create"));
+    json_obj_set(eff, "table", json_clone(tbl));
+    const char *logerr = db_log(db, eff);
+    if (logerr) return result_err(logerr);
+
     char msg[128];
     snprintf(msg, sizeof msg, "Created table '%s' (%d columns)", nv->str, cols->nelems);
     return result_ok(msg, 0);
@@ -370,6 +381,12 @@ static JsonValue *op_drop_table(Database *db, JsonValue *op)
         src->elems[i] = src->elems[i + 1];
     src->nelems--;
     json_free(t);
+
+    JsonValue *eff = json_obj();
+    json_obj_set(eff, "k", json_str("drop"));
+    json_obj_set(eff, "t", json_str(nv->str));
+    const char *logerr = db_log(db, eff);
+    if (logerr) return result_err(logerr);
 
     char msg[96];
     snprintf(msg, sizeof msg, "Dropped table '%s'", nv->str);
@@ -403,6 +420,19 @@ static JsonValue *op_insert(Database *db, JsonValue *op)
         json_obj_set(row, cname, cv);
     }
     json_arr_push(rows_of(t), row);
+
+    JsonValue *eff = json_obj();
+    json_obj_set(eff, "k", json_str("insert"));
+    json_obj_set(eff, "t", json_str(table_name(t)));
+    json_obj_set(eff, "row", json_clone(row));
+    const char *logerr = db_log(db, eff);
+    if (logerr) {
+        /* roll the row back out of memory so the log stays authoritative */
+        JsonValue *rows = rows_of(t);
+        rows->nelems--;
+        json_free(rows->elems[rows->nelems]);
+        return result_err(logerr);
+    }
 
     char msg[96];
     snprintf(msg, sizeof msg, "Inserted 1 row into '%s'", table_name(t));
@@ -483,18 +513,10 @@ static JsonValue *merge_rows(const JsonValue *left, const JsonValue *right, cons
     return out;
 }
 
-/* last component of "table.col" -> "col" (bare names returned as-is) */
-static const char *bare_name(const char *spec)
-{
-    const char *dot = strchr(spec, '.');
-    return dot ? dot + 1 : spec;
-}
-
 /* resolve a join condition column reference: if it is qualified with
  * "table.", use that table's row; otherwise try the left row first, then the
  * right. The "on" map is symmetric, so either orientation works. */
-static JsonValue *resolve_in(JsonValue *l, JsonValue *r, const char *lname, const char *rname,
-                             const char *spec)
+static JsonValue *resolve_in(JsonValue *l, JsonValue *r, const char *lname, const char *spec)
 {
     const char *dot = strchr(spec, '.');
     if (dot) {
@@ -532,8 +554,8 @@ static JsonValue *inner_join_rows(JsonValue *lt, JsonValue *rt, JsonValue *on)
             for (int p = 0; p < on->npairs; p++) {
                 JsonValue *rv = on->pairs[p].val;
                 if (!rv || rv->type != JSON_STR) { ok = 0; break; }
-                JsonValue *a = resolve_in(l, r, ltname, rtname, on->pairs[p].key);
-                JsonValue *b = resolve_in(l, r, ltname, rtname, rv->str);
+                JsonValue *a = resolve_in(l, r, ltname, on->pairs[p].key);
+                JsonValue *b = resolve_in(l, r, ltname, rv->str);
                 if (cell_cmp(a, b) != 0) { ok = 0; break; }
             }
             if (ok) json_arr_push(out, merge_rows(l, r, rtname));
@@ -702,6 +724,7 @@ static JsonValue *op_update(Database *db, JsonValue *op)
 
     JsonValue *where = json_obj_get(op, "where");
     JsonValue *rows = rows_of(t);
+    JsonValue *post = json_arr();
     int n = 0;
     for (int i = 0; i < rows->nelems; i++) {
         JsonValue *row = rows->elems[i];
@@ -711,12 +734,23 @@ static JsonValue *op_update(Database *db, JsonValue *op)
             const JsonValue *col = find_column(t, cname);
             const char *err = NULL;
             JsonValue *cv = coerce(values->pairs[v].val, col_type(col), cname, &err);
-            if (err) return result_err(err);
+            if (err) { json_free(post); return result_err(err); }
             if (col_is_pk(col) && cv->type != JSON_NULL && pk_conflict(t, cname, cv, row))
                 return result_err("update: primary key conflict");
             json_obj_set(row, cname, cv);
         }
+        json_arr_push(post, json_clone(row)); /* durable post-image */
         n++;
+    }
+    if (n > 0) {
+        JsonValue *eff = json_obj();
+        json_obj_set(eff, "k", json_str("update"));
+        json_obj_set(eff, "t", json_str(table_name(t)));
+        json_obj_set(eff, "rows", post);
+        const char *logerr = db_log(db, eff);
+        if (logerr) return result_err(logerr);
+    } else {
+        json_free(post);
     }
     char msg[96];
     snprintf(msg, sizeof msg, "Updated %d row(s) in '%s'", n, table_name(t));
@@ -732,19 +766,33 @@ static JsonValue *op_delete(Database *db, JsonValue *op)
 
     JsonValue *where = json_obj_get(op, "where");
     JsonValue *rows = rows_of(t);
+    JsonValue *pre = json_arr();
     JsonValue *kept = json_arr();
     int removed = 0;
     for (int i = 0; i < rows->nelems; i++) {
-        if (cond_matches(where, rows->elems[i]))
-            removed++; /* row matches the WHERE: delete it */
-        else
+        if (cond_matches(where, rows->elems[i])) {
+            json_arr_push(pre, json_clone(rows->elems[i])); /* durable pre-image */
+            removed++;
+        } else {
             json_arr_push(kept, rows->elems[i]);
+        }
     }
     rows->nelems = 0;
     for (int i = 0; i < kept->nelems; i++)
         json_arr_push(rows, kept->elems[i]);
     kept->nelems = 0;
     json_free(kept);
+
+    if (removed > 0) {
+        JsonValue *eff = json_obj();
+        json_obj_set(eff, "k", json_str("delete"));
+        json_obj_set(eff, "t", json_str(table_name(t)));
+        json_obj_set(eff, "rows", pre);
+        const char *logerr = db_log(db, eff);
+        if (logerr) return result_err(logerr);
+    } else {
+        json_free(pre);
+    }
 
     char msg[96];
     snprintf(msg, sizeof msg, "Deleted %d row(s) from '%s'", removed, table_name(t));
@@ -949,6 +997,47 @@ static JsonValue *op_aggregate(Database *db, JsonValue *op)
 /* ALTER TABLE                                                       */
 /* ================================================================ */
 
+/* shared by op_alter_table and WAL replay (replay must not re-log) */
+static const char *alter_add_column(JsonValue *t, JsonValue *cv)
+{
+    JsonValue *cn = json_obj_get(cv, "name");
+    if (!cn || cn->type != JSON_STR || cn->str[0] == 0) return "alter_table: column missing 'name'";
+    if (find_column(t, cn->str)) return "alter_table: column already exists";
+    JsonValue *ct = json_obj_get(cv, "type");
+    const char *ctype = (ct && ct->type == JSON_STR) ? ct->str : "text";
+    if (strcmp(ctype, "int") && strcmp(ctype, "real") && strcmp(ctype, "text"))
+        return "alter_table: unknown column type";
+    JsonValue *col = json_obj();
+    json_obj_set(col, "name", json_str(cn->str));
+    json_obj_set(col, "type", json_str(ctype));
+    json_obj_set(col, "primary", json_bool(0));
+    json_arr_push(json_obj_get(t, "columns"), col);
+    return NULL;
+}
+
+static const char *alter_drop_column(JsonValue *t, const char *drop)
+{
+    if (!find_column(t, drop)) return "alter_table: no such column";
+    JsonValue *cols = json_obj_get(t, "columns");
+    JsonValue *newcols = json_arr();
+    for (int i = 0; i < cols->nelems; i++) {
+        if (strcmp(col_name(cols->elems[i]), drop) == 0) continue;
+        json_arr_push(newcols, json_clone(cols->elems[i]));
+    }
+    json_obj_set(t, "columns", newcols); /* replaces; old columns freed by json_obj_set */
+    JsonValue *rows = rows_of(t);
+    for (int i = 0; i < rows->nelems; i++) {
+        JsonValue *old = rows->elems[i];
+        JsonValue *nr = json_obj();
+        for (int p = 0; p < old->npairs; p++)
+            if (strcmp(old->pairs[p].key, drop) != 0)
+                json_obj_set(nr, old->pairs[p].key, json_clone(old->pairs[p].val));
+        json_free(old);
+        rows->elems[i] = nr;
+    }
+    return NULL;
+}
+
 static JsonValue *op_alter_table(Database *db, JsonValue *op)
 {
     JsonValue *nv = json_obj_get(op, "table");
@@ -958,24 +1047,22 @@ static JsonValue *op_alter_table(Database *db, JsonValue *op)
 
     JsonValue *av = json_obj_get(op, "action");
     const char *action = (av && av->type == JSON_STR) ? av->str : "";
+    const char *err = NULL;
 
     if (strcmp(action, "add_column") == 0) {
         JsonValue *cv = json_obj_get(op, "column");
         if (!cv || cv->type != JSON_OBJ) return result_err("alter_table: 'column' object required");
-        JsonValue *cn = json_obj_get(cv, "name");
-        if (!cn || cn->type != JSON_STR || cn->str[0] == 0) return result_err("alter_table: column missing 'name'");
-        if (find_column(t, cn->str)) return result_err("alter_table: column already exists");
-        JsonValue *ct = json_obj_get(cv, "type");
-        const char *ctype = (ct && ct->type == JSON_STR) ? ct->str : "text";
-        if (strcmp(ctype, "int") && strcmp(ctype, "real") && strcmp(ctype, "text"))
-            return result_err("alter_table: unknown column type");
-        JsonValue *col = json_obj();
-        json_obj_set(col, "name", json_str(cn->str));
-        json_obj_set(col, "type", json_str(ctype));
-        json_obj_set(col, "primary", json_bool(0));
-        JsonValue *cols = json_obj_get(t, "columns");
-        json_arr_push(cols, col);
+        err = alter_add_column(t, cv);
+        if (err) return result_err(err);
+        JsonValue *eff = json_obj();
+        json_obj_set(eff, "k", json_str("alter"));
+        json_obj_set(eff, "t", json_str(table_name(t)));
+        json_obj_set(eff, "a", json_str("add_column"));
+        json_obj_set(eff, "c", json_clone(cv));
+        err = db_log(db, eff);
+        if (err) return result_err(err);
         char msg[96];
+        JsonValue *cn = json_obj_get(cv, "name");
         snprintf(msg, sizeof msg, "Added column '%s' to '%s'", cn->str, table_name(t));
         return result_ok(msg, 0);
     }
@@ -983,25 +1070,15 @@ static JsonValue *op_alter_table(Database *db, JsonValue *op)
     if (strcmp(action, "drop_column") == 0) {
         JsonValue *cn = json_obj_get(op, "column");
         const char *drop = (cn && cn->type == JSON_STR) ? cn->str : "";
-        if (!find_column(t, drop)) return result_err("alter_table: no such column");
-        JsonValue *cols = json_obj_get(t, "columns");
-        JsonValue *newcols = json_arr();
-        for (int i = 0; i < cols->nelems; i++) {
-            if (strcmp(col_name(cols->elems[i]), drop) == 0) continue;
-            json_arr_push(newcols, json_clone(cols->elems[i]));
-        }
-        json_obj_set(t, "columns", newcols); /* replaces; old columns freed by json_obj_set */
-        /* strip the key from every row */
-        JsonValue *rows = rows_of(t);
-        for (int i = 0; i < rows->nelems; i++) {
-            JsonValue *old = rows->elems[i];
-            JsonValue *nr = json_obj();
-            for (int p = 0; p < old->npairs; p++)
-                if (strcmp(old->pairs[p].key, drop) != 0)
-                    json_obj_set(nr, old->pairs[p].key, json_clone(old->pairs[p].val));
-            json_free(old);
-            rows->elems[i] = nr;
-        }
+        err = alter_drop_column(t, drop);
+        if (err) return result_err(err);
+        JsonValue *eff = json_obj();
+        json_obj_set(eff, "k", json_str("alter"));
+        json_obj_set(eff, "t", json_str(table_name(t)));
+        json_obj_set(eff, "a", json_str("drop_column"));
+        json_obj_set(eff, "c", json_str(drop));
+        err = db_log(db, eff);
+        if (err) return result_err(err);
         char msg[96];
         snprintf(msg, sizeof msg, "Dropped column '%s' from '%s'", drop, table_name(t));
         return result_ok(msg, 0);
@@ -1017,17 +1094,20 @@ static JsonValue *op_alter_table(Database *db, JsonValue *op)
 static JsonValue *op_batch(Database *db, JsonValue *ops)
 {
     if (ops->nelems == 0) return result_ok("Nothing to execute", 0);
+    /* WAL lines written by the sub-ops are buffered; they hit disk only on
+     * commit, so a batch is atomic in the log too. */
+    if (db->wal) wal_begin(db->wal);
     JsonValue *snapshot = json_clone(db->tables);
     JsonValue *items = json_arr();
     for (int i = 0; i < ops->nelems; i++) {
         JsonValue *res = db_exec(db, ops->elems[i]);
         json_arr_push(items, res);
         if (!result_is_ok(res)) {
-            /* roll back: discard the mutated tables, restore the snapshot */
-            JsonValue *cur = db->tables;
+            if (db->wal) wal_rollback(db->wal);
+            /* roll back: discard the mutated tables, restore the snapshot
+             * (snapshot is a deep clone, so freeing the mutated tree is safe) */
+            json_free(db->tables);
             db->tables = snapshot;
-            cur->nelems = 0;
-            json_free(cur);
             JsonValue *out = json_obj();
             json_obj_set(out, "ok", json_bool(0));
             json_obj_set(out, "rolled_back", json_bool(1));
@@ -1039,6 +1119,10 @@ static JsonValue *op_batch(Database *db, JsonValue *ops)
             json_obj_set(out, "items", items);
             return out;
         }
+    }
+    if (db->wal) {
+        const char *cerr = wal_commit(db->wal);
+        if (cerr) return result_err(cerr);
     }
     json_free(snapshot);
     JsonValue *out = json_obj();
@@ -1095,6 +1179,8 @@ void db_init(Database *db, const char *filename)
 {
     db->filename = filename ? strdup(filename) : NULL;
     db->tables = json_arr();
+    db->wal = NULL;
+    db->wal_seq = 0;
 }
 
 const char *db_load(Database *db)
@@ -1121,6 +1207,12 @@ const char *db_load(Database *db)
         if (t && t->type == JSON_ARR) tables = t;
     }
     if (!tables) { json_free(root); return "corrupt database file: missing tables array"; }
+    /* snapshot coverage marker: highest WAL seq included in this file */
+    db->wal_seq = 0;
+    if (root->type == JSON_OBJ) {
+        JsonValue *sv = json_obj_get(root, "seq");
+        if (sv && sv->type == JSON_NUM) db->wal_seq = (long)sv->num;
+    }
 
     /* transfer the table pointers out of `root` */
     if (db->tables) { db->tables->nelems = 0; json_free(db->tables); }
@@ -1138,6 +1230,7 @@ const char *db_save(Database *db)
     if (!db->filename) return NULL;
     JsonValue *root = json_obj();
     json_obj_set(root, "tables", db->tables);
+    json_obj_set(root, "seq", json_num(db->wal_seq));
     char *json = json_to_string(root);
     char tmp[1024];
     snprintf(tmp, sizeof tmp, "%s.tmp", db->filename);
@@ -1145,9 +1238,161 @@ const char *db_save(Database *db)
     if (!f) { free(json); return "cannot write database file"; }
     fputs(json, f);
     fclose(f);
-    rename(tmp, db->filename);
+    if (rename(tmp, db->filename) != 0) { free(json); return "cannot rename database file"; }
     free(json);
     return NULL;
+}
+
+/* ================================================================ */
+/* WAL integration                                                   */
+/* ================================================================ */
+
+/* log the effect of a mutation; returns an error string or NULL.
+ * The effect is a JSON object {"k":..., ...} with the sequence stamped in. */
+static const char *db_log(Database *db, JsonValue *effect)
+{
+    if (!db->wal) { json_free(effect); return NULL; }
+    db->wal_seq++;
+    json_obj_set(effect, "s", json_num(db->wal_seq));
+    char *line = json_to_string(effect);
+    json_free(effect);
+    const char *err = wal_append(db->wal, line);
+    free(line);
+    if (err) return err;
+    /* periodic in-process checkpoint keeps the log from growing unbounded */
+    if (wal_entries(db->wal) > 5000) {
+        const char *cerr = db_checkpoint(db);
+        if (cerr) return cerr;
+    }
+    return NULL;
+}
+
+const char *db_checkpoint(Database *db)
+{
+    if (db->wal) return wal_checkpoint(db->wal, db);
+    return db_save(db);
+}
+
+const char *db_attach_wal(Database *db)
+{
+    if (!db->filename) return NULL;
+    if (db->wal) return NULL;
+    db->wal = wal_open(db->filename);
+    if (!db->wal) return "WAL: cannot open (falling back to whole-file saves)";
+    return wal_replay(db->wal, db);
+}
+
+/* ---------- replay application ---------- */
+
+static int remove_table_preserve(Database *db, const char *name)
+{
+    int idx = -1;
+    for (int i = 0; i < db->tables->nelems; i++) {
+        if (strcmp(table_name(db->tables->elems[i]), name) == 0) { idx = i; break; }
+    }
+    if (idx < 0) return 0;
+    for (int i = idx; i < db->tables->nelems - 1; i++)
+        db->tables->elems[i] = db->tables->elems[i + 1];
+    db->tables->nelems--;
+    return 1;
+}
+
+/* match a row by deep equality (rows were logged as pre/post images) */
+static int find_equal_row(JsonValue *t, const JsonValue *target)
+{
+    JsonValue *rows = rows_of(t);
+    for (int i = 0; i < rows->nelems; i++)
+        if (json_equal(rows->elems[i], target)) return i;
+    return -1;
+}
+
+const char *db_wal_apply(Database *db, JsonValue *entry)
+{
+    JsonValue *sv = json_obj_get(entry, "s");
+    if (sv && sv->type == JSON_NUM && (long)sv->num <= db->wal_seq)
+        return NULL; /* already covered by the snapshot */
+    if (sv && sv->type == JSON_NUM) db->wal_seq = (long)sv->num;
+
+    JsonValue *kv = json_obj_get(entry, "k");
+    if (!kv || kv->type != JSON_STR) return "corrupt WAL: entry missing kind";
+    const char *kind = kv->str;
+
+    if (strcmp(kind, "create") == 0) {
+        JsonValue *tbl = json_obj_get(entry, "table");
+        if (!tbl || tbl->type != JSON_OBJ) return "corrupt WAL: create entry";
+        JsonValue *n = json_obj_get(tbl, "name");
+        const char *nm = (n && n->type == JSON_STR) ? n->str : "";
+        remove_table_preserve(db, nm);
+        json_arr_push(db->tables, json_clone(tbl));
+        return NULL;
+    }
+    if (strcmp(kind, "drop") == 0) {
+        JsonValue *tv = json_obj_get(entry, "t");
+        if (!tv || tv->type != JSON_STR) return "corrupt WAL: drop entry";
+        JsonValue *t = find_table(db, tv->str);
+        if (!t) return NULL; /* idempotent */
+        remove_table_preserve(db, tv->str);
+        json_free(t);
+        return NULL;
+    }
+    if (strcmp(kind, "insert") == 0) {
+        JsonValue *tv = json_obj_get(entry, "t");
+        JsonValue *row = json_obj_get(entry, "row");
+        if (!tv || tv->type != JSON_STR || !row || row->type != JSON_OBJ)
+            return "corrupt WAL: insert entry";
+        JsonValue *t = find_table(db, tv->str);
+        if (!t) return "corrupt WAL: insert into missing table";
+        json_arr_push(rows_of(t), json_clone(row));
+        return NULL;
+    }
+    if (strcmp(kind, "update") == 0 || strcmp(kind, "delete") == 0) {
+        JsonValue *tv = json_obj_get(entry, "t");
+        JsonValue *rowsv = json_obj_get(entry, "rows");
+        if (!tv || tv->type != JSON_STR || !rowsv || rowsv->type != JSON_ARR)
+            return "corrupt WAL: update/delete entry";
+        JsonValue *t = find_table(db, tv->str);
+        if (!t) return "corrupt WAL: table missing";
+        JsonValue *rows = rows_of(t);
+        for (int i = 0; i < rowsv->nelems; i++) {
+            int idx = find_equal_row(t, rowsv->elems[i]);
+            if (strcmp(kind, "delete") == 0) {
+                if (idx >= 0) {
+                    json_free(rows->elems[idx]);
+                    for (int j = idx; j < rows->nelems - 1; j++)
+                        rows->elems[j] = rows->elems[j + 1];
+                    rows->nelems--;
+                }
+            } else { /* update: replace with the logged post-image */
+                if (idx >= 0) {
+                    json_free(rows->elems[idx]);
+                    rows->elems[idx] = json_clone(rowsv->elems[i]);
+                } else {
+                    json_arr_push(rows, json_clone(rowsv->elems[i]));
+                }
+            }
+        }
+        return NULL;
+    }
+    if (strcmp(kind, "alter") == 0) {
+        JsonValue *tv = json_obj_get(entry, "t");
+        JsonValue *av = json_obj_get(entry, "a");
+        if (!tv || tv->type != JSON_STR || !av || av->type != JSON_STR)
+            return "corrupt WAL: alter entry";
+        JsonValue *t = find_table(db, tv->str);
+        if (!t) return NULL; /* idempotent on missing table */
+        if (strcmp(av->str, "add_column") == 0) {
+            JsonValue *cv = json_obj_get(entry, "c");
+            if (!cv || cv->type != JSON_OBJ) return "corrupt WAL: alter add column";
+            return alter_add_column(t, cv);
+        }
+        if (strcmp(av->str, "drop_column") == 0) {
+            JsonValue *cv = json_obj_get(entry, "c");
+            if (!cv || cv->type != JSON_STR) return "corrupt WAL: alter drop column";
+            return alter_drop_column(t, cv->str);
+        }
+        return "corrupt WAL: unknown alter action";
+    }
+    return "corrupt WAL: unknown kind";
 }
 
 /* ================================================================ */

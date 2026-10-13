@@ -306,6 +306,19 @@ JsonValue *json_parse(const char *text)
     return v;
 }
 
+JsonValue *json_parse_len(const char *text, int len)
+{
+    if (!text) return NULL;
+    /* normalize to a NUL-terminated slice (no copying if safe is impossible) */
+    char *tmp = malloc((size_t)len + 1);
+    if (!tmp) return NULL;
+    memcpy(tmp, text, (size_t)len);
+    tmp[len] = '\0';
+    JsonValue *v = json_parse(tmp);
+    free(tmp);
+    return v;
+}
+
 /* ---------------------------------------------------------------- */
 /* stringify                                                         */
 /* ---------------------------------------------------------------- */
@@ -423,6 +436,32 @@ JsonValue *json_clone(const JsonValue *v)
         break;
     }
     return out;
+}
+
+int json_equal(const JsonValue *a, const JsonValue *b)
+{
+    if (a == b) return 1;
+    if (!a || !b) return 0;
+    if (a->type != b->type) return 0;
+    switch (a->type) {
+    case JSON_NULL: return 1;
+    case JSON_BOOL: return a->boolean == b->boolean;
+    case JSON_NUM:  return a->num == b->num;
+    case JSON_STR:  return strcmp(a->str, b->str) == 0;
+    case JSON_ARR:
+        if (a->nelems != b->nelems) return 0;
+        for (int i = 0; i < a->nelems; i++)
+            if (!json_equal(a->elems[i], b->elems[i])) return 0;
+        return 1;
+    case JSON_OBJ:
+        if (a->npairs != b->npairs) return 0;
+        for (int i = 0; i < a->npairs; i++) {
+            JsonValue *bv = json_obj_get(b, a->pairs[i].key);
+            if (!bv || !json_equal(a->pairs[i].val, bv)) return 0;
+        }
+        return 1;
+    }
+    return 0;
 }
 
 void json_free(JsonValue *v)

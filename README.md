@@ -9,8 +9,18 @@ Features: CREATE/DROP/ALTER TABLE, INSERT, UPDATE, DELETE, SELECT with `WHERE`
 (equality, `gt/gte/lt/lte/ne`, `IN`, `LIKE`, `BETWEEN`, nested `and`/`or`),
 `ORDER BY`, `LIMIT`, `DISTINCT`, **INNER JOIN**, **aggregations**
 (`count/sum/avg/min/max` + `GROUP BY`), primary keys with auto-increment and
-type enforcement, JSON file persistence, and **atomic multi-op batches**
-(all-or-nothing with rollback).
+type enforcement, and **crash-safe durability**:
+
+- a **write-ahead log** (`<db>.wal`) records every mutation with a sequence
+  number and `fsync`s it before the statement is confirmed;
+- the snapshot file carries the covered `seq`, so **crash recovery replays
+  exactly the entries a checkpoint did not cover** — nothing is lost, nothing
+  duplicated;
+- **checkpoints** (on clean exit, on demand, or automatically when the log
+  grows) fold the log into the snapshot and truncate it;
+- `{"ops":[...]}` batches and interactive **`BEGIN`/`COMMIT`/`ROLLBACK`**
+  transactions buffer their log entries and apply them atomically — a crash
+  or rollback discards them entirely.
 
 ```
 you:  "show me users older than 26, newest first"
@@ -31,11 +41,13 @@ you:  "show me users older than 26, newest first"
 | file        | role                                                        |
 |-------------|--------------------------------------------------------------|
 | `json.c/h`  | tiny recursive-descent JSON parser + serializer (wire format)|
-| `db.c/h`    | the database engine: tables/rows in memory, WHERE evaluation,|
-|             | type coercion, primary keys, ORDER BY/LIMIT, JSON persistence |
+| `db.c/h`    | the database engine: tables/rows, WHERE, JOIN, aggregate,    |
+|             | PKs, type coercion, durable effect logging, seq checkpoints  |
+| `wal.c/h`   | write-ahead log: fsync'd mutation records, atomic batch      |
+|             | buffering, crash replay, snapshot checkpointing              |
 | `llm.c/h`   | OpenAI-compatible `/chat/completions` client (libcurl)       |
-| `main.c`    | REPL: bundles the schema into a system prompt, calls the LLM,|
-|             | plans via `db_exec`, pretty-prints results, saves the db     |
+| `main.c`    | REPL: LLM system prompt, multi-turn memory, BEGIN/COMMIT/   |
+|             | ROLLBACK, result printing, attach WAL + recover on startup   |
 
 ## Build & run
 
@@ -97,7 +109,19 @@ delete discontinued products
 show tables / describe products
 ```
 
-Meta commands (handled locally): `help`, `exit`/`quit`.
+Meta commands (handled locally): `help`, `exit`/`quit`, and the
+**transaction keywords** `begin` / `commit` / `rollback`:
+
+```
+isql> begin
+BEGIN
+isql> insert alice 30;
+Inserted 1 row into 'users'
+isql> insert bob 25;
+Inserted 1 row into 'users'
+isql> rollback
+ROLLBACK                     ; both inserts undone, nothing written to disk
+```
 
 ## The query plan (what the LLM speaks)
 
@@ -166,7 +190,8 @@ This is a learning project, not production software:
 ```
 main.c      REPL, system prompt, multi-turn memory, printing    db.c/h   engine, JOIN, aggregate, WHERE, atomic batches, persistence
 json.c/h    JSON parser/serializer                              llm.c/h  OpenAI-compatible HTTP client
-tests/      test_engine.c (49 offline unit checks), mock_llm.py (fake OpenAI server)
+tests/      test_engine.c (66 offline unit checks), mock_llm.py (fake OpenAI
+server), crash_recovery.sh (kill -9 + end-to-end recovery)
 ```
 
 The multi-turn memory keeps the last 6 (request -> plan) pairs in the system
