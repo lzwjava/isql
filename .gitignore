@@ -1,6 +1,8 @@
 *.o
 isql
 test_engine
+test_btree
+bench
 isql.db.json
 isql.db.json.tmp
 bench
