@@ -196,13 +196,15 @@ static int stmd_ends_with(const char *s, char c)
 
 static void print_help(void)
 {
-    printf("isql - AI-driven minimal database\n"
+    printf("isql 0.4 - AI-driven minimal database\n"
            "  Natural language or SQL is parsed by an LLM into a JSON plan and\n"
            "  executed by a tiny embedded engine (no SQL parser in the binary).\n\n"
-           "  CREATE TABLE / DROP / INSERT / SELECT / UPDATE / DELETE\n"
-           "  \"show tables\", \"describe <table>\"\n\n"
+           "  CREATE/DROP/ALTER TABLE, INSERT, SELECT (JOIN/WHERE/GROUP BY),\n"
+           "  UPDATE, DELETE, aggregates, DISTINCT, LIKE/IN/BETWEEN\n"
+           "  \"show tables\", \"describe <table>\", \"explain <query>\" (plan + cost),\n"
+           "  begin / commit / rollback (transactions)\n\n"
            "  End a statement with ';' or press Enter on an empty line.\n"
-           "  Meta commands: help, exit/quit\n");
+           "  Meta commands: help, exit/quit.  ISQL_EXPLAIN=1 prints every plan.\n");
 }
 
 /* ---------------- fake LLM (offline demo/testing) ----------------
@@ -323,12 +325,32 @@ static void history_prompt(char *buf, int buflen)
     }
 }
 
+static void print_explain(Database *db, JsonValue *plan)
+{
+    char *s = json_to_string(plan);
+    printf("[plan] %s\n", s);
+    free(s);
+    JsonValue *opv = json_obj_get(plan, "op");
+    const char *opname = (opv && opv->type == JSON_STR) ? opv->str : "batch";
+    int rows = db_plan_source_rows(db, plan);
+    int idx  = db_plan_uses_index(db, plan);
+    printf("[cost] %s: scans/joins %d row(s), pk index: %s\n",
+           opname, rows, idx ? "yes (B+ tree)" : "no (full scan)");
+}
+
 static void run_statement(const char *stmt)
 {
+    const char *orig = stmt;
+    int explain = 0;
+    if (strncmp(stmt, "explain", 7) == 0 && stmt[7] == ' ') {
+        explain = 1;
+        stmt = stmt + 8;
+        while (*stmt == ' ') stmt++;
+    }
+
     char *schema = db_schema_prompt(&db);
     char conv[4096];
     history_prompt(conv, sizeof conv);
-
     char *sysprompt = malloc(16384 + 4096 + strlen(conv) + 64);
     snprintf(sysprompt, (size_t)(16384 + 4096 + strlen(conv) + 64),
              "%s\n%s\n%s", LLM_RULES, conv, schema);
@@ -340,43 +362,106 @@ static void run_statement(const char *stmt)
     if (!base)  base  = "https://api.openai.com/v1";
     if (!model) model = "gpt-4o-mini";
 
+    int fake = getenv("ISQL_FAKE_LLM") != NULL;
+    int attempts = fake ? 1 : 2; /* one automatic self-correction on the real path */
+
     JsonValue *plan = NULL;
     JsonValue *res = NULL;
-    if (getenv("ISQL_FAKE_LLM")) {
-        printf("[fake-llm] %s\n", stmt);
-        plan = fake_parse(stmt);
-    } else {
-        LlmReply r = llm_chat(base, key, model, sysprompt, stmt);
-        if (r.error) {
-            printf("LLM error: %s\n", r.error);
-            free(r.error);
+    const char *last_err = NULL;
+
+    for (int attempt = 0; attempt < attempts; attempt++) {
+        /* ---- 1. obtain a plan (model or fake) ---- */
+        if (fake) {
+            if (attempt == 0) printf("[fake-llm] %s\n", stmt);
+            plan = fake_parse(stmt);
+        } else {
+            char *user_msg;
+            if (attempt == 0) {
+                user_msg = strdup(stmt);
+            } else {
+                user_msg = malloc(strlen(orig) + strlen(last_err ? last_err : "") + 300);
+                snprintf(user_msg, strlen(orig) + strlen(last_err ? last_err : "") + 300,
+                         "Query: %s\n\nYour previous plan was rejected: %s\n"
+                         "Reply with ONE corrected JSON query plan only, no explanations.",
+                         orig, last_err ? last_err : "validation error");
+            }
+            LlmReply r = llm_chat(base, key, model, sysprompt, user_msg);
+            free(user_msg);
+            if (r.error) {
+                printf("LLM error: %s\n", r.error);
+                free(r.error);
+                free(sysprompt);
+                return;
+            }
+            plan = json_parse(r.content);
+            free(r.content);
+        }
+        if (!plan) {
+            printf("LLM error: could not parse the plan as JSON\n");
             free(sysprompt);
             return;
         }
-        plan = json_parse(r.content);
-        free(r.content);
-        free(sysprompt);
+
+        /* ---- 2. EXPLAIN (cost transparency) ---- */
+        if (explain || getenv("ISQL_EXPLAIN"))
+            print_explain(&db, plan);
+        if (explain) {
+            char ans[64];
+            printf("execute? [y/N] ");
+            fflush(stdout);
+            if (!fgets(ans, sizeof ans, stdin) || (ans[0] != 'y' && ans[0] != 'Y')) {
+                printf("skipped\n");
+                json_free(plan);
+                free(sysprompt);
+                return;
+            }
+        }
+
+        /* ---- 3. schema-validate, then execute ---- */
+        const char *verr = db_validate_plan(&db, plan);
+        if (verr) {
+            last_err = verr;
+            json_free(plan);
+            plan = NULL;
+            if (attempt == attempts - 1) break;
+            continue; /* ask the model to fix it (real path only) */
+        }
+        res = db_exec(&db, plan);
+        if (!res_is_ok(res)) {
+            JsonValue *m = json_obj_get(res, "message");
+            last_err = (m && m->type == JSON_STR) ? m->str : "execution error";
+            if (attempt < attempts - 1) {
+                json_free(res);
+                json_free(plan);
+                res = NULL;
+                plan = NULL;
+                continue;
+            }
+        }
+        break;
     }
 
     if (!plan) {
-        printf("LLM error: could not parse the plan as JSON\n");
+        printf("PLAN ERROR: the model's plan was rejected (%s)\n", last_err ? last_err : "unknown reason");
+        free(sysprompt);
         return;
     }
 
-    res = db_exec(&db, plan);
-    print_result(res);
-    if (res_is_ok(res) && !db.wal) {
-        /* no WAL (disabled or could not attach): fall back to a full snapshot */
-        const char *err = db_save(&db);
-        if (err) printf("WARNING: cannot save: %s\n", err);
+    if (res) {
+        print_result(res);
+        if (res_is_ok(res) && !db.wal) {
+            const char *err = db_save(&db);
+            if (err) printf("WARNING: cannot save: %s\n", err);
+        }
+        if (res_is_ok(res)) {
+            char *planjson = json_to_string(plan);
+            history_add(stmt, planjson);
+            free(planjson);
+        }
     }
-
-    /* remember this exchange for follow-up questions */
-    char *planjson = json_to_string(plan);
-    history_add(stmt, planjson);
-    free(planjson);
     json_free(res);
     json_free(plan);
+    free(sysprompt);
 }
 
 int main(int argc, char **argv)
@@ -399,7 +484,7 @@ int main(int argc, char **argv)
         if (werr) fprintf(stderr, "isql: %s\n", werr);
     }
 
-    printf("isql 0.3 - AI-driven minimal database\n"
+    printf("isql 0.4 - AI-driven minimal database\n"
            "  base : %s\n  model: %s\n  db   : %s\n"
            "  type 'help' for usage, 'exit' to quit\n\n",
            getenv("ISQL_BASE") ? getenv("ISQL_BASE") : "https://api.openai.com/v1",
@@ -450,6 +535,7 @@ int main(int argc, char **argv)
             }
             if (strcmp(t, "rollback") == 0) {
                 if (!txn_active) { printf("no transaction in progress\n"); continue; }
+                db_index_invalidate_all(&db);
                 json_free(db.tables); /* mutated tree; snapshot is a deep clone */
                 db.tables = txn_snap;
                 if (db.wal) wal_rollback(db.wal);

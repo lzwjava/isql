@@ -331,6 +331,75 @@ int main(void)
     check(ok_code(r) && rows_of_result(r) == 6, "rollback keeps order count at 6");
     json_free(r);
 
+    /* ================= Phase 4: primary-key B+ index ===================== */
+    check(ok_code(run(&db,"{\"op\":\"create_table\",\"table\":\"people\",\"columns\":[{\"name\":\"id\",\"type\":\"int\",\"primary\":true},{\"name\":\"name\",\"type\":\"text\"},{\"name\":\"city\",\"type\":\"text\"}]}")), "create people");
+    for (int i = 1; i <= 200; i++) {
+        char plan[512];
+        snprintf(plan, sizeof plan,
+                 "{\"op\":\"insert\",\"table\":\"people\",\"values\":{\"id\":%d,\"name\":\"n%d\",\"city\":\"c%d\"}}",
+                 i, i, i % 5);
+        r = run(&db, plan);
+        json_free(r);
+    }
+    r = run(&db, "{\"op\":\"select\",\"table\":\"people\",\"where\":{\"id\":42}}");
+    check(ok_code(r) && rows_of_result(r) == 1, "pk-equality select finds its row");
+    check(db.idx_probes > 0, "pk-equality query actually used the index");
+    JsonValue *row42 = rows_of_result(r) > 0 ? json_obj_get(json_obj_get(r, "rows")->elems[0], "city") : NULL;
+    check(row42 && row42->type == JSON_STR && strcmp(row42->str, "c2") == 0, "indexed lookup returned the right row");
+    json_free(r);
+
+    /* update by pk; index stays consistent */
+    r = run(&db, "{\"op\":\"update\",\"table\":\"people\",\"values\":{\"city\":\"zz\"},\"where\":{\"id\":42}}");
+    check(ok_code(r), "update by pk ok");
+    json_free(r);
+    r = run(&db, "{\"op\":\"select\",\"table\":\"people\",\"where\":{\"id\":42}}");
+    JsonValue *row42b = rows_of_result(r) > 0 ? json_obj_get(json_obj_get(r, "rows")->elems[0], "city") : NULL;
+    check(row42b && row42b->type == JSON_STR && strcmp(row42b->str, "zz") == 0, "index still points at the updated row");
+    json_free(r);
+
+    /* duplicate pk rejected via the index fast path */
+    r = run(&db, "{\"op\":\"insert\",\"table\":\"people\",\"values\":{\"id\":42,\"name\":\"x\"}}");
+    check(!ok_code(r), "duplicate pk rejected (index conflict check)");
+    json_free(r);
+
+    /* auto-increment via bt_max continues after the indexed inserts */
+    r = run(&db, "{\"op\":\"insert\",\"table\":\"people\",\"values\":{\"name\":\"last\",\"city\":\"z\"}}");
+    check(ok_code(r), "auto-pk insert ok");
+    json_free(r);
+    r = run(&db, "{\"op\":\"select\",\"table\":\"people\",\"where\":{\"name\":\"last\"}}");
+    JsonValue *lastid = rows_of_result(r) > 0 ? json_obj_get(json_obj_get(r, "rows")->elems[0], "id") : NULL;
+    check(lastid && lastid->type == JSON_NUM && lastid->num == 201, "auto-increment continued via index max (id 201)");
+    json_free(r);
+
+    /* non-pk predicates do NOT touch the index (full scan) */
+    long probes_before = db.idx_probes;
+    r = run(&db, "{\"op\":\"select\",\"table\":\"people\",\"where\":{\"city\":\"c1\"}}");
+    check(ok_code(r) && rows_of_result(r) == 40, "non-pk full scan still correct (40 rows)");
+    check(db.idx_probes == probes_before, "non-pk predicate used no index probes");
+    json_free(r);
+
+    /* delete + re-probe stays correct */
+    r = run(&db, "{\"op\":\"delete\",\"table\":\"people\",\"where\":{\"id\":1}}");
+    check(ok_code(r), "delete by pk ok");
+    json_free(r);
+    r = run(&db, "{\"op\":\"select\",\"table\":\"people\",\"where\":{\"id\":1}}");
+    check(ok_code(r) && rows_of_result(r) == 0, "deleted row gone via index");
+    json_free(r);
+
+    /* ================= Phase 5: plan validator =========================== */
+    JsonValue *bad = json_parse("{\"op\":\"select\",\"table\":\"nope\",\"where\":{\"id\":1}}");
+    check(db_validate_plan(&db, bad) != NULL, "validator rejects an unknown table");
+    json_free(bad);
+    bad = json_parse("{\"op\":\"insert\",\"table\":\"people\",\"values\":{\"bogus\":1}}");
+    check(db_validate_plan(&db, bad) != NULL, "validator rejects unknown column in values");
+    json_free(bad);
+    bad = json_parse("{\"op\":\"select\",\"table\":\"people\",\"columns\":[\"id\"],\"where\":{\"id\":1}}");
+    check(db_validate_plan(&db, bad) == NULL, "validator accepts a valid plan");
+    json_free(bad);
+    bad = json_parse("{\"op\":\"select\",\"table\":\"people\",\"where\":{\"and\":[{\"id\":1},{\"city\":\"c1\"}]}}");
+    check(db_validate_plan(&db, bad) == NULL, "validator accepts nested and/of conditions");
+    json_free(bad);
+
     printf("\n%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

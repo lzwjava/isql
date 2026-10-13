@@ -3,3 +3,4 @@ isql
 test_engine
 isql.db.json
 isql.db.json.tmp
+bench

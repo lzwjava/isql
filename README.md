@@ -45,6 +45,7 @@ you:  "show me users older than 26, newest first"
 |             | PKs, type coercion, durable effect logging, seq checkpoints  |
 | `wal.c/h`   | write-ahead log: fsync'd mutation records, atomic batch      |
 |             | buffering, crash replay, snapshot checkpointing              |
+| `btree.c/h` | in-memory B+ tree used as the primary-key index (lazy cache) |
 | `llm.c/h`   | OpenAI-compatible `/chat/completions` client (libcurl)       |
 | `main.c`    | REPL: LLM system prompt, multi-turn memory, BEGIN/COMMIT/   |
 |             | ROLLBACK, result printing, attach WAL + recover on startup   |
@@ -56,7 +57,9 @@ On macOS `libcurl` ships with the OS; on Linux e.g. `apt install libcurl4-openss
 
 ```sh
 make            # builds ./isql
-make test       # offline engine unit tests (no LLM, no libcurl)
+make test       # 92 offline unit checks (engine + B+ tree)
+make benchmarks # pk index vs full-scan micro benchmark
+bash tests/crash_recovery.sh   # SIGKILL the binary, verify WAL recovery
 ```
 
 ### With a real LLM (OpenAI-compatible)
@@ -165,6 +168,20 @@ ROLLBACK                     ; both inserts undone, nothing written to disk
 Types are enforced at write time (`int`, `real`, `text`); primary keys are unique and
 auto-increment when omitted.
 
+## EXPLAIN, validation and self-correction
+
+Every statement is **schema-validated** against the live tables before it is
+executed; on the real-LLM path a rejected plan is sent back to the model once
+with the exact error (a "hallucination guard"):
+
+```
+[plan] {"op":"select","table":"users","columns":"*","where":{"age":{"gt":25}}}
+[cost] select: scans/joins 3 row(s), pk index: no (full scan)
+```
+
+- `explain <query>` prints the plan + cost estimate, then asks before running.
+- `ISQL_EXPLAIN=1` prints them for every statement without asking.
+
 ## Persistence
 
 The whole database is a JSON document (tables → columns → rows). It loads from
@@ -175,9 +192,12 @@ successful mutation.
 
 This is a learning project, not production software:
 
-- No indexes — full scans only (fine for tiny tables).
-- LEFT/FULL joins, subqueries and transactions spanning multiple statements are
-  not implemented (single-statement `{"ops":[...]}` batches are atomic though).
+- The **primary-key B+ index** is a lazily rebuilt in-memory cache: inserts
+  update it incrementally (O(log n) duplicate checks and auto-increment),
+  while updates/deletes mark it dirty and the next lookup rebuilds it. It
+  accelerates `where: {"pk": value}` — ~14,000x faster than a full scan.
+- LEFT/FULL joins, subqueries and multi-statement transactions are not
+  implemented (`{"ops":[...]}` batches are atomic within a statement though).
 - `join` merges rows; columns are exposed as `"<table>.<col>"` when the bare
   name collides between the two tables.
 - No SQL parser of its own — that's the point: the LLM does the parsing, so
@@ -190,8 +210,9 @@ This is a learning project, not production software:
 ```
 main.c      REPL, system prompt, multi-turn memory, printing    db.c/h   engine, JOIN, aggregate, WHERE, atomic batches, persistence
 json.c/h    JSON parser/serializer                              llm.c/h  OpenAI-compatible HTTP client
-tests/      test_engine.c (66 offline unit checks), mock_llm.py (fake OpenAI
-server), crash_recovery.sh (kill -9 + end-to-end recovery)
+tests/      test_engine.c (83 checks), test_btree.c (9 checks), bench.c
+(pk vs scan benchmark), mock_llm.py (fake OpenAI server),
+crash_recovery.sh (kill -9 + end-to-end recovery)
 ```
 
 The multi-turn memory keeps the last 6 (request -> plan) pairs in the system

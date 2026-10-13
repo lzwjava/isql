@@ -8,6 +8,7 @@
  */
 #include "db.h"
 #include "wal.h"
+#include "btree.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -163,6 +164,135 @@ static JsonValue *result_err(const char *msg)
 }
 
 /* ================================================================ */
+/* primary-key index (B+ tree, lazily built)                          */
+/* ================================================================ */
+
+static IndexSlot *index_slot(Database *db, const char *table)
+{
+    for (int i = 0; i < db->nidx; i++)
+        if (strcmp(db->idx[i].table, table) == 0) return &db->idx[i];
+    return NULL;
+}
+
+static void index_drop_slot(Database *db, const char *table)
+{
+    IndexSlot *s = index_slot(db, table);
+    if (!s) return;
+    bt_free(s->tree);
+    s->tree = NULL;
+    s->dirty = 1;
+    for (int i = (int)(s - db->idx); i < db->nidx - 1; i++)
+        db->idx[i] = db->idx[i + 1];
+    db->nidx--;
+}
+
+/* mark every index invalid (after a rollback, replay, checkpoint, load) */
+void db_index_invalidate_all(Database *db)
+{
+    for (int i = 0; i < db->nidx; i++) {
+        bt_free(db->idx[i].tree);
+        db->idx[i].tree = NULL;
+        db->idx[i].dirty = 1;
+    }
+}
+
+void db_index_invalidate_table(Database *db, const char *table)
+{
+    IndexSlot *s = index_slot(db, table);
+    if (s) s->dirty = 1;
+}
+
+/* (re)build the index for table t; returns the slot or NULL when the table
+ * has no numeric primary key (nothing to index). */
+static IndexSlot *index_ensure(Database *db, JsonValue *t)
+{
+    const char *name = table_name(t);
+    IndexSlot *s = index_slot(db, name);
+    if (!s) {
+        db->idx = realloc(db->idx, sizeof(IndexSlot) * (db->nidx + 1));
+        s = &db->idx[db->nidx++];
+        s->table = strdup(name);
+        s->tree = NULL;
+        s->dirty = 1;
+    }
+    /* find the pk column and confirm it is numeric */
+    JsonValue *cols = (JsonValue *)cols_of(t);
+    const char *pkcol = NULL;
+    for (int i = 0; i < cols->nelems; i++) {
+        if (col_is_pk(cols->elems[i])) { pkcol = col_name(cols->elems[i]); break; }
+    }
+    if (!pkcol)
+        return NULL; /* no pk: index not applicable */
+    for (int i = 0; i < cols->nelems; i++) {
+        if (col_is_pk(cols->elems[i])) {
+            const char *ty = col_type(cols->elems[i]);
+            if (strcmp(ty, "int") != 0 && strcmp(ty, "real") != 0) return NULL;
+        }
+    }
+
+    if (!s->dirty && s->tree) return s;
+
+    bt_free(s->tree);
+    s->tree = bt_create();
+    JsonValue *rows = rows_of(t);
+    for (int i = 0; i < rows->nelems; i++) {
+        JsonValue *cell = json_obj_get(rows->elems[i], pkcol);
+        double d;
+        if (cell && json_is_num_or_numeric_string(cell, &d)) {
+            if (s->tree) bt_insert(s->tree, d, rows->elems[i]);
+        }
+    }
+    s->dirty = 0;
+    db->idx_builds++;
+    return s;
+}
+
+/* exact-key lookup: returns the stored row pointer or NULL when absent */
+static JsonValue *index_lookup(Database *db, JsonValue *t, double key)
+{
+    IndexSlot *s = index_ensure(db, t);
+    if (!s || !s->tree) return NULL;
+    db->idx_probes++;
+    JsonValue *row = NULL;
+    if (bt_search(s->tree, key, &row)) return row;
+    return NULL;
+}
+
+/* if `where` is exactly {"pkcol": <number>}, return a 1-element array with
+ * the matching row (or an empty array when absent); NULL when not applicable
+ * so the caller falls back to a full scan. */
+static JsonValue *pk_probe(Database *db, JsonValue *t, JsonValue *where)
+{
+    if (!where || where->type != JSON_OBJ || where->npairs != 1)
+        return NULL;
+    JsonValue *andv = json_obj_get(where, "and");
+    JsonValue *orv  = json_obj_get(where, "or");
+    if (andv || orv) return NULL;
+
+    const char *col = where->pairs[0].key;
+    /* is `col` the numeric pk? */
+    JsonValue *cols = (JsonValue *)cols_of(t);
+    const char *pkcol = NULL;
+    int numeric_pk = 0;
+    for (int i = 0; i < cols->nelems; i++) {
+        if (col_is_pk(cols->elems[i])) {
+            pkcol = col_name(cols->elems[i]);
+            const char *ty = col_type(cols->elems[i]);
+            numeric_pk = (strcmp(ty, "int") == 0 || strcmp(ty, "real") == 0);
+        }
+    }
+    if (!pkcol || !numeric_pk || strcmp(col, pkcol) != 0) return NULL;
+
+    double key;
+    if (!json_is_num_or_numeric_string(where->pairs[0].val, &key)) return NULL;
+
+    JsonValue *out = json_arr();
+    JsonValue *row = index_lookup(db, t, key);
+    if (row) json_arr_push(out, row);
+    return out;
+}
+
+/* ================================================================ */
 /* WHERE evaluation                                                  */
 /* ================================================================ */
 
@@ -273,13 +403,22 @@ static const JsonValue *find_column(const JsonValue *tbl, const char *name)
     return NULL;
 }
 
-/* next value for an auto-increment primary key */
-static JsonValue *next_pk(const JsonValue *tbl, const JsonValue *col)
+static int index_active_for(Database *db, JsonValue *t, const char *cname); /* fwd */
+
+/* next value for an auto-increment primary key (O(height) via the index) */
+static JsonValue *next_pk(Database *db, JsonValue *t, const JsonValue *col)
 {
-    JsonValue *rows = rows_of((JsonValue *)tbl);
+    const char *cname = col_name(col);
+    if (index_active_for(db, t, cname)) {
+        IndexSlot *s = index_slot(db, table_name(t));
+        int found = 0;
+        double m = bt_max(s->tree, &found);
+        if (found) return json_num(m >= 0 ? m + 1 : 1);
+        return json_num(1);
+    }
+    JsonValue *rows = rows_of(t);
     double max = 0;
     int have = 0;
-    const char *cname = col_name(col);
     for (int i = 0; i < rows->nelems; i++) {
         JsonValue *cell = json_obj_get(rows->elems[i], cname);
         if (cell && cell->type == JSON_NUM && (!have || cell->num > max)) {
@@ -290,10 +429,34 @@ static JsonValue *next_pk(const JsonValue *tbl, const JsonValue *col)
     return json_num(have ? max + 1 : 1);
 }
 
-/* does any row (other than `skip`) already have this pk value? */
-static const JsonValue *pk_conflict(const JsonValue *tbl, const char *cname, JsonValue *val, JsonValue *skip_row)
+/* index is usable when a valid, un-dirty slot exists for this numeric pk */
+static int index_active_for(Database *db, JsonValue *t, const char *cname)
 {
-    JsonValue *rows = rows_of((JsonValue *)tbl);
+    IndexSlot *s = index_slot(db, table_name(t));
+    if (!s || s->dirty || !s->tree) return 0;
+    JsonValue *cols = (JsonValue *)cols_of(t);
+    int numeric = 0;
+    for (int i = 0; i < cols->nelems; i++) {
+        if (col_is_pk(cols->elems[i])) {
+            if (strcmp(col_name(cols->elems[i]), cname) != 0) return 0;
+            const char *ty = col_type(cols->elems[i]);
+            numeric = (strcmp(ty, "int") == 0 || strcmp(ty, "real") == 0);
+        }
+    }
+    return numeric;
+}
+
+/* does any row (other than `skip`) already have this pk value? */
+static const JsonValue *pk_conflict(Database *db, JsonValue *t, const char *cname, JsonValue *val, JsonValue *skip_row)
+{
+    double d;
+    if (index_active_for(db, t, cname) && json_is_num_or_numeric_string(val, &d)) {
+        IndexSlot *s = index_slot(db, table_name(t));
+        JsonValue *found = NULL;
+        if (s->tree && bt_search(s->tree, d, &found) && found != skip_row)
+            return found;
+    }
+    JsonValue *rows = rows_of(t);
     for (int i = 0; i < rows->nelems; i++) {
         JsonValue *row = rows->elems[i];
         if (row == skip_row) continue;
@@ -373,6 +536,7 @@ static JsonValue *op_drop_table(Database *db, JsonValue *op)
     JsonValue *t = find_table(db, nv->str);
     if (!t) return result_err("drop_table: no such table");
 
+    index_drop_slot(db, table_name(t));
     JsonValue *src = db->tables;
     int idx = -1;
     for (int i = 0; i < src->nelems; i++)
@@ -411,11 +575,11 @@ static JsonValue *op_insert(Database *db, JsonValue *op)
         const char *cname = col_name(col);
         JsonValue *v = json_obj_get(values, cname);
         if (col_is_pk(col) && (!v || v->type == JSON_NULL))
-            v = next_pk(t, col);
+            v = next_pk(db, t, col);
         const char *err = NULL;
         JsonValue *cv = coerce(v, col_type(col), cname, &err);
         if (err) { json_free(row); return result_err(err); }
-        if (col_is_pk(col) && cv->type != JSON_NULL && pk_conflict(t, cname, cv, NULL))
+        if (col_is_pk(col) && cv->type != JSON_NULL && pk_conflict(db, t, cname, cv, NULL))
             return result_err("insert: primary key already exists");
         json_obj_set(row, cname, cv);
     }
@@ -432,6 +596,22 @@ static JsonValue *op_insert(Database *db, JsonValue *op)
         rows->nelems--;
         json_free(rows->elems[rows->nelems]);
         return result_err(logerr);
+    }
+
+    /* if a valid pk index exists, keep it incrementally correct */
+    const char *pkcol = NULL;
+    for (int i = 0; i < cols->nelems; i++)
+        if (col_is_pk(cols->elems[i])) { pkcol = col_name(cols->elems[i]); break; }
+    if (pkcol) {
+        IndexSlot *s = index_slot(db, table_name(t));
+        if (s && !s->dirty && s->tree) {
+            JsonValue *pkv = json_obj_get(row, pkcol);
+            double d;
+            if (pkv && json_is_num_or_numeric_string(pkv, &d))
+                bt_insert(s->tree, d, row);
+            else
+                s->dirty = 1; /* non-numeric pk: cannot maintain the index */
+        }
     }
 
     char msg[96];
@@ -648,9 +828,18 @@ static JsonValue *op_select(Database *db, JsonValue *op)
         allnames = json_arr();
         for (int i = 0; i < cols->nelems; i++)
             json_arr_push(allnames, json_str(col_name(cols->elems[i])));
-        src = all_rows_owned(t);
+        JsonValue *probe = pk_probe(db, t, json_obj_get(op, "where"));
+        if (probe) {
+            src = json_arr();
+            for (int i = 0; i < probe->nelems; i++) /* index hit: < 2 rows */
+                json_arr_push(src, json_clone(probe->elems[i]));
+            probe->nelems = 0;
+            json_free(probe);
+        } else {
+            src = all_rows_owned(t);
+        }
     }
-    /* WHERE applies after the join (SQL semantics) */
+    /* WHERE applies after the join (SQL semantics); re-check is idempotent */
     src = filter_rows_owned(src, json_obj_get(op, "where"));
 
     JsonValue *ord = json_obj_get(op, "order_by");
@@ -723,7 +912,8 @@ static JsonValue *op_update(Database *db, JsonValue *op)
             return result_err("update: unknown column in 'values'");
 
     JsonValue *where = json_obj_get(op, "where");
-    JsonValue *rows = rows_of(t);
+    JsonValue *probe = pk_probe(db, t, where);
+    JsonValue *rows = probe ? probe : rows_of(t);
     JsonValue *post = json_arr();
     int n = 0;
     for (int i = 0; i < rows->nelems; i++) {
@@ -734,14 +924,15 @@ static JsonValue *op_update(Database *db, JsonValue *op)
             const JsonValue *col = find_column(t, cname);
             const char *err = NULL;
             JsonValue *cv = coerce(values->pairs[v].val, col_type(col), cname, &err);
-            if (err) { json_free(post); return result_err(err); }
-            if (col_is_pk(col) && cv->type != JSON_NULL && pk_conflict(t, cname, cv, row))
+            if (err) { json_free(post); if (probe) { probe->nelems = 0; json_free(probe); } return result_err(err); }
+            if (col_is_pk(col) && cv->type != JSON_NULL && pk_conflict(db, t, cname, cv, row))
                 return result_err("update: primary key conflict");
             json_obj_set(row, cname, cv);
         }
         json_arr_push(post, json_clone(row)); /* durable post-image */
         n++;
     }
+    if (probe) { probe->nelems = 0; json_free(probe); } /* view over table rows */
     if (n > 0) {
         JsonValue *eff = json_obj();
         json_obj_set(eff, "k", json_str("update"));
@@ -749,6 +940,11 @@ static JsonValue *op_update(Database *db, JsonValue *op)
         json_obj_set(eff, "rows", post);
         const char *logerr = db_log(db, eff);
         if (logerr) return result_err(logerr);
+        /* a change to the pk column invalidates the index (row identity moved) */
+        for (int v = 0; v < values->npairs; v++) {
+            const JsonValue *c2 = find_column(t, values->pairs[v].key);
+            if (c2 && col_is_pk(c2)) db_index_invalidate_table(db, table_name(t));
+        }
     } else {
         json_free(post);
     }
@@ -765,23 +961,46 @@ static JsonValue *op_delete(Database *db, JsonValue *op)
     if (!t) return result_err("delete: no such table");
 
     JsonValue *where = json_obj_get(op, "where");
-    JsonValue *rows = rows_of(t);
+    JsonValue *trows = rows_of(t);
+    JsonValue *probe = pk_probe(db, t, where);
     JsonValue *pre = json_arr();
-    JsonValue *kept = json_arr();
     int removed = 0;
-    for (int i = 0; i < rows->nelems; i++) {
-        if (cond_matches(where, rows->elems[i])) {
-            json_arr_push(pre, json_clone(rows->elems[i])); /* durable pre-image */
-            removed++;
-        } else {
-            json_arr_push(kept, rows->elems[i]);
+
+    if (probe) {
+        /* index fast path: the probe lists the rows to delete (by pointer) */
+        for (int i = 0; i < probe->nelems; i++) {
+            JsonValue *row = probe->elems[i];
+            int idx = -1;
+            for (int j = 0; j < trows->nelems; j++)
+                if (trows->elems[j] == row) { idx = j; break; }
+            if (idx >= 0) {
+                json_arr_push(pre, json_clone(row)); /* durable pre-image */
+                json_free(trows->elems[idx]);
+                for (int j = idx; j < trows->nelems - 1; j++)
+                    trows->elems[j] = trows->elems[j + 1];
+                trows->nelems--;
+                removed++;
+            }
         }
+        probe->nelems = 0;
+        json_free(probe);
+    } else {
+        /* full scan: keep the non-matching rows */
+        JsonValue *kept = json_arr();
+        for (int i = 0; i < trows->nelems; i++) {
+            if (cond_matches(where, trows->elems[i])) {
+                json_arr_push(pre, json_clone(trows->elems[i]));
+                removed++;
+            } else {
+                json_arr_push(kept, trows->elems[i]);
+            }
+        }
+        trows->nelems = 0;
+        for (int i = 0; i < kept->nelems; i++)
+            json_arr_push(trows, kept->elems[i]);
+        kept->nelems = 0;
+        json_free(kept);
     }
-    rows->nelems = 0;
-    for (int i = 0; i < kept->nelems; i++)
-        json_arr_push(rows, kept->elems[i]);
-    kept->nelems = 0;
-    json_free(kept);
 
     if (removed > 0) {
         JsonValue *eff = json_obj();
@@ -790,6 +1009,7 @@ static JsonValue *op_delete(Database *db, JsonValue *op)
         json_obj_set(eff, "rows", pre);
         const char *logerr = db_log(db, eff);
         if (logerr) return result_err(logerr);
+        db_index_invalidate_table(db, table_name(t)); /* row identity changed */
     } else {
         json_free(pre);
     }
@@ -1072,6 +1292,7 @@ static JsonValue *op_alter_table(Database *db, JsonValue *op)
         const char *drop = (cn && cn->type == JSON_STR) ? cn->str : "";
         err = alter_drop_column(t, drop);
         if (err) return result_err(err);
+        db_index_invalidate_table(db, table_name(t));
         JsonValue *eff = json_obj();
         json_obj_set(eff, "k", json_str("alter"));
         json_obj_set(eff, "t", json_str(table_name(t)));
@@ -1106,6 +1327,7 @@ static JsonValue *op_batch(Database *db, JsonValue *ops)
             if (db->wal) wal_rollback(db->wal);
             /* roll back: discard the mutated tables, restore the snapshot
              * (snapshot is a deep clone, so freeing the mutated tree is safe) */
+            db_index_invalidate_all(db);
             json_free(db->tables);
             db->tables = snapshot;
             JsonValue *out = json_obj();
@@ -1181,6 +1403,10 @@ void db_init(Database *db, const char *filename)
     db->tables = json_arr();
     db->wal = NULL;
     db->wal_seq = 0;
+    db->idx = NULL;
+    db->nidx = 0;
+    db->idx_probes = 0;
+    db->idx_builds = 0;
 }
 
 const char *db_load(Database *db)
@@ -1241,6 +1467,185 @@ const char *db_save(Database *db)
     if (rename(tmp, db->filename) != 0) { free(json); return "cannot rename database file"; }
     free(json);
     return NULL;
+}
+
+/* ================================================================ */
+/* plan validation & cost analysis (EXPLAIN / LLM self-retry)        */
+/* ================================================================ */
+
+static int col_visible(JsonValue *t, JsonValue *jt, const char *spec)
+{
+    const char *dot = strchr(spec, '.');
+    if (dot) {
+        if (strncmp(spec, table_name(t), (size_t)(dot - spec)) == 0 &&
+            strlen(table_name(t)) == (size_t)(dot - spec))
+            return find_column(t, dot + 1) != NULL;
+        if (jt && strncmp(spec, table_name(jt), (size_t)(dot - spec)) == 0 &&
+            strlen(table_name(jt)) == (size_t)(dot - spec))
+            return find_column(jt, dot + 1) != NULL;
+        return 0;
+    }
+    if (find_column(t, spec)) return 1;
+    if (jt && find_column(jt, spec)) return 1;
+    return 0;
+}
+
+static int where_cols_ok(JsonValue *t, JsonValue *jt, JsonValue *cond)
+{
+    if (!cond || cond->type != JSON_OBJ) return 1;
+    JsonValue *andv = json_obj_get(cond, "and");
+    JsonValue *orv  = json_obj_get(cond, "or");
+    if (andv || orv) {
+        if (andv && andv->type == JSON_ARR)
+            for (int i = 0; i < andv->nelems; i++)
+                if (!where_cols_ok(t, jt, andv->elems[i])) return 0;
+        if (orv && orv->type == JSON_ARR)
+            for (int i = 0; i < orv->nelems; i++)
+                if (!where_cols_ok(t, jt, orv->elems[i])) return 0;
+        return 1;
+    }
+    for (int i = 0; i < cond->npairs; i++)
+        if (!col_visible(t, jt, cond->pairs[i].key)) return 0;
+    return 1;
+}
+
+/* non-destructive schema check; returns an error message or NULL */
+const char *db_validate_plan(Database *db, JsonValue *op)
+{
+    if (!op || op->type != JSON_OBJ) return "bad plan: not an object";
+    if (json_obj_get(op, "ops")) return NULL; /* batches are checked per op by the engine */
+    static const char *known[] = { "create_table", "drop_table", "alter_table", "insert",
+        "select", "aggregate", "update", "delete", "show_tables", "describe", "error", NULL };
+    JsonValue *opv = json_obj_get(op, "op");
+    if (!opv || opv->type != JSON_STR) return "bad plan: missing string 'op'";
+    const char *name = opv->str;
+    int k = 0;
+    for (; known[k]; k++) if (strcmp(known[k], name) == 0) break;
+    if (!known[k]) return "bad plan: unknown operation";
+    if (strcmp(name, "error") == 0 || strcmp(name, "show_tables") == 0) return NULL;
+
+    JsonValue *tv = json_obj_get(op, "table");
+    const char *tbl = (tv && tv->type == JSON_STR) ? tv->str : "";
+    JsonValue *t = (tbl[0] != 0) ? find_table(db, tbl) : NULL;
+
+    if (strcmp(name, "create_table") == 0) {
+        if (tbl[0] == 0) return "create_table: missing table name";
+        if (strpbrk(tbl, " \t\"{}[]")) return "create_table: invalid table name";
+        if (t) return "create_table: table already exists";
+        JsonValue *colsv = json_obj_get(op, "columns");
+        if (!colsv || colsv->type != JSON_ARR || colsv->nelems == 0)
+            return "create_table: 'columns' array required";
+        return NULL;
+    }
+    if (tbl[0] == 0) return "bad plan: missing 'table'";
+    if (!t) return "no such table in the schema (the model may have invented it)";
+    if (strcmp(name, "drop_table") == 0 || strcmp(name, "describe") == 0) return NULL;
+
+    /* join table, if any */
+    JsonValue *jt = NULL;
+    JsonValue *jv = strcmp(name, "select") == 0 ? json_obj_get(op, "join") : NULL;
+    if (jv && jv->type == JSON_OBJ) {
+        JsonValue *jn = json_obj_get(jv, "table");
+        const char *jname = (jn && jn->type == JSON_STR) ? jn->str : "";
+        jt = (jname[0] != 0) ? find_table(db, jname) : NULL;
+        if (!jt) return "join table not found in the schema";
+        JsonValue *on = json_obj_get(jv, "on");
+        if (on && on->type == JSON_OBJ) {
+            for (int i = 0; i < on->npairs; i++) {
+                JsonValue *rv = on->pairs[i].val;
+                if (!col_visible(t, jt, on->pairs[i].key)) return "join 'on' references an unknown column";
+                if (!rv || rv->type != JSON_STR || !col_visible(t, jt, rv->str))
+                    return "join 'on' references an unknown column";
+            }
+        }
+    }
+
+    if (strcmp(name, "insert") == 0 || strcmp(name, "update") == 0) {
+        JsonValue *values = json_obj_get(op, "values");
+        if (values && values->type == JSON_OBJ)
+            for (int i = 0; i < values->npairs; i++)
+                if (!find_column(t, values->pairs[i].key))
+                    return "values reference a column that does not exist";
+    }
+    if (strcmp(name, "select") == 0) {
+        JsonValue *cols = json_obj_get(op, "columns");
+        if (cols && cols->type == JSON_ARR)
+            for (int i = 0; i < cols->nelems; i++) {
+                JsonValue *c = cols->elems[i];
+                if (!c || c->type != JSON_STR || !col_visible(t, jt, c->str))
+                    return "select references a column that does not exist";
+            }
+        JsonValue *ord = json_obj_get(op, "order_by");
+        if (ord && ord->type == JSON_ARR)
+            for (int i = 0; i < ord->nelems; i++) {
+                JsonValue *o = ord->elems[i];
+                JsonValue *c = o ? json_obj_get(o, "column") : NULL;
+                if (!c || c->type != JSON_STR || !col_visible(t, jt, c->str))
+                    return "order_by references a column that does not exist";
+            }
+    }
+    if (strcmp(name, "aggregate") == 0) {
+        JsonValue *gb = json_obj_get(op, "group_by");
+        if (gb && gb->type == JSON_ARR)
+            for (int i = 0; i < gb->nelems; i++) {
+                JsonValue *g = gb->elems[i];
+                if (!g || g->type != JSON_STR || !col_visible(t, jt, g->str))
+                    return "group_by references a column that does not exist";
+            }
+        JsonValue *aggs = json_obj_get(op, "aggs");
+        if (aggs && aggs->type == JSON_ARR)
+            for (int i = 0; i < aggs->nelems; i++)
+                if (!json_obj_get(aggs->elems[i], "func"))
+                    return "aggregate agg is missing 'func'";
+    }
+    if (strcmp(name, "select") == 0 || strcmp(name, "update") == 0 ||
+        strcmp(name, "delete") == 0 || strcmp(name, "aggregate") == 0) {
+        if (!where_cols_ok(t, jt, json_obj_get(op, "where")))
+            return "where clause references a column that does not exist";
+    }
+    return NULL;
+}
+
+/* ---------------- EXPLAIN helpers (pure estimates, no side effects) --------- */
+
+int db_plan_source_rows(Database *db, JsonValue *plan)
+{
+    JsonValue *tv = json_obj_get(plan, "table");
+    if (!tv || tv->type != JSON_STR) return 0;
+    JsonValue *t = find_table(db, tv->str);
+    if (!t) return 0;
+    long n = rows_of(t)->nelems;
+    JsonValue *jv = json_obj_get(plan, "join");
+    if (jv && jv->type == JSON_OBJ) {
+        JsonValue *jn = json_obj_get(jv, "table");
+        JsonValue *jt = (jn && jn->type == JSON_STR) ? find_table(db, jn->str) : NULL;
+        if (jt) n *= (long)rows_of(jt)->nelems; /* nested-loop join pair count */
+    }
+    return (int)n;
+}
+
+int db_plan_uses_index(Database *db, JsonValue *plan)
+{
+    JsonValue *tv = json_obj_get(plan, "table");
+    if (!tv || tv->type != JSON_STR) return 0;
+    JsonValue *t = find_table(db, tv->str);
+    if (!t) return 0;
+    JsonValue *where = json_obj_get(plan, "where");
+    if (!where || where->type != JSON_OBJ || where->npairs != 1) return 0;
+    if (json_obj_get(where, "and") || json_obj_get(where, "or")) return 0;
+    const char *col = where->pairs[0].key;
+    JsonValue *cols = (JsonValue *)cols_of(t);
+    int numeric_pk = 0;
+    for (int i = 0; i < cols->nelems; i++) {
+        if (col_is_pk(cols->elems[i])) {
+            const char *ty = col_type(cols->elems[i]);
+            numeric_pk = (strcmp(ty, "int") == 0 || strcmp(ty, "real") == 0) &&
+                         strcmp(col_name(cols->elems[i]), col) == 0;
+        }
+    }
+    if (!numeric_pk) return 0;
+    double d;
+    return json_is_num_or_numeric_string(where->pairs[0].val, &d);
 }
 
 /* ================================================================ */
