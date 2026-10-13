@@ -83,21 +83,43 @@ class Handler(BaseHTTPRequestHandler):
             if m.get("role") == "user":
                 user_msg = m.get("content", "")
         plan = plan_for(user_msg)
-        payload = json.dumps(
-            {
-                "id": "chatcmpl-mock",
-                "object": "chat.completion",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": json.dumps(plan)},
-                        "finish_reason": "stop",
-                    }
-                ],
-            }
-        ).encode()
+        plan_str = json.dumps(plan)
+        streaming = bool(body.get("stream"))
+        if not streaming:
+            payload = json.dumps(
+                {
+                    "id": "chatcmpl-mock",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": plan_str},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        # streamed (SSE) response: split the plan into a few deltas
+        chunks = []
+        for i in range(0, len(plan_str), max(1, len(plan_str) // 4 or 1)):
+            chunks.append(plan_str[i : i + max(1, len(plan_str) // 4 or 1)])
+        body_lines = [
+            "data: " + json.dumps({"choices": [{"delta": {"role": "assistant"}}]}),
+        ]
+        for c in chunks:
+            body_lines.append(
+                "data: " + json.dumps({"choices": [{"delta": {"content": c}}]})
+            )
+        body_lines.append("data: [DONE]")
+        payload = ("\n\n".join(body_lines) + "\n\n").encode()
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)

@@ -57,7 +57,9 @@ On macOS `libcurl` ships with the OS; on Linux e.g. `apt install libcurl4-openss
 
 ```sh
 make            # builds ./isql
-make test       # 92 offline unit checks (engine + B+ tree)
+make test       # 100 offline unit checks (engine + B+ tree + SSE parser)
+make corpus     # 25 golden-logic cases (sqllogictest style)
+make fuzz       # ./fuzz 1000000 [seed] — JSON/engine/roundtrip fuzzing
 make benchmarks # pk index vs full-scan micro benchmark
 bash tests/crash_recovery.sh   # SIGKILL the binary, verify WAL recovery
 ```
@@ -181,6 +183,9 @@ with the exact error (a "hallucination guard"):
 
 - `explain <query>` prints the plan + cost estimate, then asks before running.
 - `ISQL_EXPLAIN=1` prints them for every statement without asking.
+- Completions **stream** (SSE) by default: the plan tokens appear as the model
+  emits them (`ISQL_STREAM=0` to disable). Servers/proxies that ignore
+  streaming degrade gracefully to a plain response.
 
 ## Persistence
 
@@ -208,11 +213,12 @@ This is a learning project, not production software:
 ## Files
 
 ```
-main.c      REPL, system prompt, multi-turn memory, printing    db.c/h   engine, JOIN, aggregate, WHERE, atomic batches, persistence
-json.c/h    JSON parser/serializer                              llm.c/h  OpenAI-compatible HTTP client
-tests/      test_engine.c (83 checks), test_btree.c (9 checks), bench.c
-(pk vs scan benchmark), mock_llm.py (fake OpenAI server),
-crash_recovery.sh (kill -9 + end-to-end recovery)
+main.c      REPL, system prompt, streaming, multi-turn memory, printing
+json.c/h    JSON parser/serializer (nesting-depth guarded)
+llm.c/h     HTTP client; llm_sse.c/h  SSE stream parser (unit-tested)
+tests/      test_engine.c (83), test_btree.c (9), test_sse.c (8),
+            sqllogic.c + corpus.logic (25 golden cases), fuzz.c,
+            bench.c, mock_llm.py (fake OpenAI server), crash_recovery.sh
 ```
 
 The multi-turn memory keeps the last 6 (request -> plan) pairs in the system

@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define MAX_LINE 65536
 #define MAX_STMT (8 * MAX_LINE)
@@ -196,7 +197,7 @@ static int stmd_ends_with(const char *s, char c)
 
 static void print_help(void)
 {
-    printf("isql 0.4 - AI-driven minimal database\n"
+    printf("isql 0.5 - AI-driven minimal database\n"
            "  Natural language or SQL is parsed by an LLM into a JSON plan and\n"
            "  executed by a tiny embedded engine (no SQL parser in the binary).\n\n"
            "  CREATE/DROP/ALTER TABLE, INSERT, SELECT (JOIN/WHERE/GROUP BY),\n"
@@ -325,6 +326,18 @@ static void history_prompt(char *buf, int buflen)
     }
 }
 
+/* echo LLM deltas to the terminal as they stream in */
+static void on_llm_delta(const char *delta, void *arg)
+{
+    int *started = (int *)arg;
+    if (delta && !*started) {
+        fputs("[plan] ", stdout);
+        *started = 1;
+    }
+    if (delta) fputs(delta, stdout);
+    fflush(stdout);
+}
+
 static void print_explain(Database *db, JsonValue *plan)
 {
     char *s = json_to_string(plan);
@@ -374,6 +387,13 @@ static void run_statement(const char *stmt)
         if (fake) {
             if (attempt == 0) printf("[fake-llm] %s\n", stmt);
             plan = fake_parse(stmt);
+            if (plan && getenv("ISQL_STREAM") && strcmp(getenv("ISQL_STREAM"), "0") != 0) {
+                char *pj = json_to_string(plan);
+                fputs("[plan] ", stdout);
+                for (int i = 0; pj[i]; i++) { putchar(pj[i]); fflush(stdout); usleep(2000); }
+                printf("\n");
+                free(pj);
+            }
         } else {
             char *user_msg;
             if (attempt == 0) {
@@ -385,8 +405,15 @@ static void run_statement(const char *stmt)
                          "Reply with ONE corrected JSON query plan only, no explanations.",
                          orig, last_err ? last_err : "validation error");
             }
-            LlmReply r = llm_chat(base, key, model, sysprompt, user_msg);
+            int streaming = !getenv("ISQL_STREAM") || strcmp(getenv("ISQL_STREAM"), "0") != 0;
+            int echo_started = 0;
+            LlmReply r;
+            if (streaming)
+                r = llm_chat_stream(base, key, model, sysprompt, user_msg, on_llm_delta, &echo_started);
+            else
+                r = llm_chat(base, key, model, sysprompt, user_msg);
             free(user_msg);
+            if (streaming && echo_started) printf("\n");
             if (r.error) {
                 printf("LLM error: %s\n", r.error);
                 free(r.error);
@@ -484,7 +511,7 @@ int main(int argc, char **argv)
         if (werr) fprintf(stderr, "isql: %s\n", werr);
     }
 
-    printf("isql 0.4 - AI-driven minimal database\n"
+    printf("isql 0.5 - AI-driven minimal database\n"
            "  base : %s\n  model: %s\n  db   : %s\n"
            "  type 'help' for usage, 'exit' to quit\n\n",
            getenv("ISQL_BASE") ? getenv("ISQL_BASE") : "https://api.openai.com/v1",

@@ -90,6 +90,7 @@ typedef struct {
     const char *s;
     int i;
     int len;
+    int depth;
 } Parser;
 
 static void skip_ws(Parser *p)
@@ -281,24 +282,31 @@ static JsonValue *parse_object(Parser *p)
     return obj;
 }
 
+static int max_depth_seen = 0;
+
 static JsonValue *parse_value(Parser *p)
 {
     skip_ws(p);
     if (p->i >= p->len) { json_error("empty input"); return NULL; }
     char c = p->s[p->i];
-    if (c == '{') return parse_object(p);
-    if (c == '[') return parse_array(p);
-    if (c == '"') return parse_string(p);
-    if (c == '-' || isdigit((unsigned char)c)) return parse_number(p);
-    if (c == 't' || c == 'f' || c == 'n') return parse_literal(p);
-    json_error("unexpected char");
-    return NULL;
+    if (p->depth >= 400) { json_error("nesting too deep"); return NULL; }
+    p->depth++;
+    if (p->depth > max_depth_seen) max_depth_seen = p->depth;
+    JsonValue *v = NULL;
+    if (c == '{') v = parse_object(p);
+    else if (c == '[') v = parse_array(p);
+    else if (c == '"') v = parse_string(p);
+    else if (c == '-' || isdigit((unsigned char)c)) v = parse_number(p);
+    else if (c == 't' || c == 'f' || c == 'n') v = parse_literal(p);
+    else json_error("unexpected char");
+    p->depth--;
+    return v;
 }
 
 JsonValue *json_parse(const char *text)
 {
     if (!text) return NULL;
-    Parser p = { text, 0, (int)strlen(text) };
+    Parser p = { text, 0, (int)strlen(text), 0 };
     JsonValue *v = parse_value(&p);
     if (!v) return NULL;
     skip_ws(&p);
@@ -309,6 +317,7 @@ JsonValue *json_parse(const char *text)
 JsonValue *json_parse_len(const char *text, int len)
 {
     if (!text) return NULL;
+    if (len < 0) return NULL;
     /* normalize to a NUL-terminated slice (no copying if safe is impossible) */
     char *tmp = malloc((size_t)len + 1);
     if (!tmp) return NULL;
@@ -341,6 +350,7 @@ static void emit(WB *w, const char *s)
     }
     memcpy(w->buf + w->buf_len, s, (size_t)extra);
     w->buf_len += extra;
+    w->buf[w->buf_len] = '\0'; /* always keep the buffer terminated */
 }
 
 static void emit_str(WB *w, const char *s)

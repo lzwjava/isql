@@ -1,0 +1,119 @@
+# corpus.logic — golden plans for natural-language queries against isql's engine.
+# Each "case" is the kind of user utterance a real LLM would translate; the
+# golden "plan" is what a correct model emitted when the engine was at its
+# current state. Running `make sqllogic` checks the ENGINE still honors them.
+#
+# Format: table / seed / case / plan / expect (<n> | error | message <substr>)
+
+table users: id:int:pk, name:text, age:int, city:text
+seed users: 1,alice,30,nyc
+seed users: 2,bob,25,sf
+seed users: 3,carol,40,nyc
+seed users: 4,dave,22,la
+seed users: 5,anna,33,sf
+
+case "users older than 26"
+plan {"op":"select","table":"users","where":{"age":{"gt":26}}}
+expect 3
+
+case "users between 25 and 30"
+plan {"op":"select","table":"users","where":{"age":{"between":[25,30]}}}
+expect 2
+
+case "names starting with a"
+plan {"op":"select","table":"users","where":{"name":{"like":"a%"}}}
+expect 2
+
+case "everyone from nyc or la"
+plan {"op":"select","table":"users","where":{"or":[{"city":"nyc"},{"city":"la"}]}}
+expect 3
+
+case "everyone from sf and older than 40"
+plan {"op":"select","table":"users","where":{"and":[{"city":"sf"},{"age":{"gt":40}}]}}
+expect 0
+
+case "top 2 by age desc"
+plan {"op":"select","table":"users","order_by":[{"column":"age","desc":true}],"limit":2}
+expect 2
+
+case "distinct cities"
+plan {"op":"select","table":"users","columns":["city"],"distinct":true}
+expect 3
+
+case "count per city"
+plan {"op":"aggregate","table":"users","group_by":["city"],"aggs":[{"as":"n","func":"count","column":"*"}]}
+expect 3
+
+case "average age"
+plan {"op":"aggregate","table":"users","aggs":[{"as":"avg_age","func":"avg","column":"age"}]}
+expect 1
+
+case "bob turns 26"
+plan {"op":"update","table":"users","values":{"age":26},"where":{"name":"bob"}}
+expect 1
+
+case "twenty-six or older after bob turns 26"
+plan {"op":"select","table":"users","where":{"age":{"gt":26}}}
+expect 3
+
+case "delete dave"
+plan {"op":"delete","table":"users","where":{"name":"dave"}}
+expect 1
+
+case "users older than 26"
+plan {"op":"select","table":"users","where":{"age":{"gt":26}}}
+expect 3
+
+case "duplicate primary key is rejected"
+plan {"op":"insert","table":"users","values":{"id":1,"name":"x"}}
+expect error
+
+case "unknown table is rejected"
+plan {"op":"select","table":"ghosts"}
+expect error
+
+case "unknown column in where is rejected"
+plan {"op":"select","table":"users","where":{"nope":1}}
+expect error
+
+case "add an email column"
+plan {"op":"alter_table","table":"users","action":"add_column","column":{"name":"email","type":"text"}}
+expect 0
+
+case "select the new column (nulls)"
+plan {"op":"select","table":"users","columns":["email"],"limit":1}
+expect 1
+
+case "drop the email column"
+plan {"op":"alter_table","table":"users","action":"drop_column","column":"email"}
+expect 0
+
+case "show the tables"
+plan {"op":"show_tables"}
+expect 1
+
+# ---- joins ---------------------------------------------------------------
+table orders: id:int:pk, user_id:int, total:real
+seed orders: 1,1,150.5
+seed orders: 2,2,40
+seed orders: 3,5,90.25
+
+case "orders with the buyer's name"
+plan {"op":"select","table":"orders","join":{"table":"users","on":{"users.id":"orders.user_id"}},"columns":["users.name","orders.total"]}
+expect 3
+
+case "big orders with the buyer"
+plan {"op":"select","table":"orders","join":{"table":"users","on":{"users.id":"orders.user_id"}},"columns":["users.name","orders.total"],"where":{"orders.total":{"gt":100}}}
+expect 1
+
+case "atomic batch: a failing insert rolls back the whole batch"
+plan {"ops":[{"op":"insert","table":"orders","values":{"id":4,"user_id":1,"total":10}},{"op":"insert","table":"orders","values":{"id":4,"user_id":2,"total":10}}]}
+expect error
+
+case "orders count is unchanged after the rollback"
+plan {"op":"select","table":"orders"}
+expect 3
+
+case "orders for user 1"
+plan {"op":"select","table":"orders","where":{"user_id":1}}
+expect 1

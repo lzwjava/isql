@@ -18,4 +18,11 @@ typedef struct {
 LlmReply llm_chat(const char *base, const char *key, const char *model,
                   const char *system_prompt, const char *user_msg);
 
+/* streamed variant: with `stream` requests enabled, each content delta is
+ * delivered to on_delta(content, arg) as it arrives. Pass on_delta=NULL for
+ * a regular non-streamed completion (equivalent to llm_chat). */
+LlmReply llm_chat_stream(const char *base, const char *key, const char *model,
+                         const char *system_prompt, const char *user_msg,
+                         void (*on_delta)(const char *delta, void *arg), void *arg);
+
 #endif

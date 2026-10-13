@@ -6,3 +6,5 @@ bench
 isql.db.json
 isql.db.json.tmp
 bench
+sqllogic
+fuzz

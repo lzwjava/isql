@@ -472,6 +472,7 @@ static const JsonValue *pk_conflict(Database *db, JsonValue *t, const char *cnam
 /* ================================================================ */
 
 /* forward declarations: WAL helpers are implemented with the persistence code */
+static int where_cols_ok(JsonValue *t, JsonValue *jt, JsonValue *cond); /* fwd */
 static const char *db_log(Database *db, JsonValue *effect);
 const char *db_checkpoint(Database *db);
 
@@ -821,9 +822,13 @@ static JsonValue *op_select(Database *db, JsonValue *op)
         if (!jt) return result_err("select: join table not found");
         JsonValue *on = json_obj_get(join, "on");
         if (!on || on->type != JSON_OBJ) return result_err("select: join requires an 'on' object");
+        if (!where_cols_ok(t, jt, json_obj_get(op, "where")))
+            return result_err("select: where clause references an unknown column");
         src = inner_join_rows(t, jt, on);
         allnames = joined_column_names(t, jt);
     } else {
+        if (!where_cols_ok(t, NULL, json_obj_get(op, "where")))
+            return result_err("select: where clause references an unknown column");
         JsonValue *cols = (JsonValue *)cols_of(t);
         allnames = json_arr();
         for (int i = 0; i < cols->nelems; i++)
@@ -912,6 +917,8 @@ static JsonValue *op_update(Database *db, JsonValue *op)
             return result_err("update: unknown column in 'values'");
 
     JsonValue *where = json_obj_get(op, "where");
+    if (!where_cols_ok(t, NULL, where))
+        return result_err("update: where clause references an unknown column");
     JsonValue *probe = pk_probe(db, t, where);
     JsonValue *rows = probe ? probe : rows_of(t);
     JsonValue *post = json_arr();
@@ -961,6 +968,8 @@ static JsonValue *op_delete(Database *db, JsonValue *op)
     if (!t) return result_err("delete: no such table");
 
     JsonValue *where = json_obj_get(op, "where");
+    if (!where_cols_ok(t, NULL, where))
+        return result_err("delete: where clause references an unknown column");
     JsonValue *trows = rows_of(t);
     JsonValue *probe = pk_probe(db, t, where);
     JsonValue *pre = json_arr();
