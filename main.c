@@ -41,27 +41,46 @@ static const char *LLM_RULES =
     "       {\"name\":\"score\",\"type\":\"real\"}]}\n"
     "    types: \"int\", \"real\", \"text\". At most one primary key column.\n"
     " 2. drop_table      {\"op\":\"drop_table\",\"table\":\"name\"}\n"
-    " 3. insert\n"
+    " 3. alter_table\n"
+    "    {\"op\":\"alter_table\",\"table\":\"name\",\"action\":\"add_column\",\"column\":{\"name\":\"email\",\"type\":\"text\"}}\n"
+    "    action: add_column | drop_column (drop uses {\"column\":\"email\"} as a string)\n"
+    " 4. insert\n"
     "    {\"op\":\"insert\",\"table\":\"name\",\"values\":{\"name\":\"alice\",\"score\":9.5}}\n"
     "    (omit the primary key to auto-increment it)\n"
-    " 4. select\n"
-    "    {\"op\":\"select\",\"table\":\"name\",\"columns\":[\"name\",\"score\"],\n"
+    " 5. select\n"
+    "    {\"op\":\"select\",\"table\":\"name\",\"columns\":[\"users.name\",\"orders.total\"],\n"
     "     \"where\":{\"score\":{\"gt\":5}},\"order_by\":[{\"column\":\"score\",\"desc\":true}],\n"
-    "     \"limit\":10}\n"
-    "    \"columns\" may be \"*\" for all; \"where\", \"order_by\", \"limit\" are optional.\n"
-    " 5. update\n"
+    "     \"limit\":10,\"distinct\":true}\n"
+    "    \"columns\" may be \"*\" for all; \"where\", \"order_by\", \"limit\", \"distinct\" are optional.\n"
+    " 6. select with a JOIN (INNER). The join is a sibling of the base table:\n"
+    "    {\"op\":\"select\",\"table\":\"orders\",\"join\":{\"table\":\"users\",\"on\":{\"users.id\":\"orders.user_id\"}},\n"
+    "     \"columns\":[\"users.name\",\"orders.total\"],\"where\":{\"orders.total\":{\"gt\":100}}}\n"
+    "    \"on\" maps left columns to right columns (all equalities must hold). Right-side\n"
+    "    columns are addressed as \"<table>.<col>\" when the bare name collides with the left.\n"
+    " 7. aggregate\n"
+    "    {\"op\":\"aggregate\",\"table\":\"name\",\"where\":{...},\"group_by\":[\"city\"],\n"
+    "     \"aggs\":[{\"as\":\"n\",\"func\":\"count\",\"column\":\"*\"},\n"
+    "              {\"as\":\"total\",\"func\":\"sum\",\"column\":\"score\"},\n"
+    "              {\"as\":\"avg\",\"func\":\"avg\",\"column\":\"score\"},\n"
+    "              {\"as\":\"youngest\",\"func\":\"min\",\"column\":\"age\"}]}\n"
+    "    funcs: count (column \"*\" or a name), sum, avg, min, max. \"group_by\" optional.\n"
+    " 8. update\n"
     "    {\"op\":\"update\",\"table\":\"name\",\"values\":{\"score\":10},\"where\":{\"name\":\"alice\"}}\n"
-    " 6. delete         {\"op\":\"delete\",\"table\":\"name\",\"where\":{\"score\":{\"lt\":3}}}\n"
-    " 7. show_tables    {\"op\":\"show_tables\"}\n"
-    " 8. describe       {\"op\":\"describe\",\"table\":\"name\"}\n"
-    " 9. error          {\"op\":\"error\",\"message\":\"why the request cannot be handled\"}\n"
+    " 9. delete         {\"op\":\"delete\",\"table\":\"name\",\"where\":{\"score\":{\"lt\":3}}}\n"
+    " 10. show_tables   {\"op\":\"show_tables\"}\n"
+    " 11. describe      {\"op\":\"describe\",\"table\":\"name\"}\n"
+    " 12. error         {\"op\":\"error\",\"message\":\"why the request cannot be handled\"}\n"
+    " 13. batch (for multi-step requests):\n"
+    "     {\"ops\":[<any ops above>, ...]}  executes all-or-nothing (rolls back on failure)\n"
     "\n"
     "\"where\" grammar (\"and\"/\"or\" for boolean logic, nested allowed):\n"
-    "  {\"col\": 5}                 equality\n"
-    "  {\"col\": {\"gt\":5}}         gt | gte | lt | lte | ne\n"
-    "  {\"and\": [<cond>, ...]}     all must match\n"
-    "  {\"or\":  [<cond>, ...]}     at least one must match\n"
-    "  {\"col\": \"text\"}           text equality\n"
+    "  {\"col\": 5}                    equality\n"
+    "  {\"col\": {\"gt\":5}}            gt | gte | lt | lte | ne\n"
+    "  {\"col\": {\"in\":[1,2,3]}}      value in array\n"
+    "  {\"col\": {\"like\":\"a%\"}}      pattern: % = any sequence, _ = one char\n"
+    "  {\"col\": {\"between\":[lo,hi]}}  inclusive range (numeric)\n"
+    "  {\"and\": [<cond>, ...]}        all must match\n"
+    "  {\"or\":  [<cond>, ...]}        at least one must match\n"
     "Values must be JSON: numbers unquoted, strings in double quotes.";
 
 /* ---------------- pretty printer ---------------- */
@@ -81,9 +100,26 @@ static const char *cell_display(const JsonValue *v, char *buf, int buflen)
     return "?";
 }
 
+static int res_is_ok(JsonValue *res)
+{
+    JsonValue *ok = res ? json_obj_get(res, "ok") : NULL;
+    return ok && ok->type == JSON_BOOL && ok->boolean;
+}
+
 static void print_result(JsonValue *res)
 {
     if (!res) { printf("(no result)\n"); return; }
+    JsonValue *items = json_obj_get(res, "items");
+    if (items && items->type == JSON_ARR) {
+        JsonValue *msgv = json_obj_get(res, "message");
+        JsonValue *rb   = json_obj_get(res, "rolled_back");
+        printf("%s\n", (msgv && msgv->type == JSON_STR) ? msgv->str : "");
+        for (int i = 0; i < items->nelems; i++)
+            print_result(items->elems[i]);
+        if (rb && rb->type == JSON_BOOL && rb->boolean)
+            printf("BATCH ROLLED BACK - no changes were kept.\n");
+        return;
+    }
     JsonValue *okv  = json_obj_get(res, "ok");
     JsonValue *msgv = json_obj_get(res, "message");
     int ok = okv && okv->type == JSON_BOOL && okv->boolean;
@@ -168,31 +204,129 @@ static void print_help(void)
  * When ISQL_FAKE_LLM=1 the REPL skips the network call and substitutes a
  * deterministic canned parser, so the full pipeline works with no API key.
  * The real path uses llm_chat() and is otherwise identical. */
+static double fake_user_id(const char *name)
+{
+    for (int t = 0; t < db.tables->nelems; t++) {
+        JsonValue *tbl = db.tables->elems[t];
+        JsonValue *n = json_obj_get(tbl, "name");
+        if (!n || n->type != JSON_STR || strcmp(n->str, "users") != 0) continue;
+        JsonValue *rows = json_obj_get(tbl, "rows");
+        for (int i = 0; i < rows->nelems; i++) {
+            JsonValue *nm = json_obj_get(rows->elems[i], "name");
+            if (nm && nm->type == JSON_STR && strcmp(nm->str, name) == 0) {
+                JsonValue *id = json_obj_get(rows->elems[i], "id");
+                if (id && id->type == JSON_NUM) return id->num;
+            }
+        }
+    }
+    return -1;
+}
+
 static JsonValue *fake_parse(const char *stmt)
 {
     const char *u = stmt;
-    if (strstr(u, "create"))
+    char tmp[512];
+
+    if (strstr(u, "create") && strstr(u, "orders"))
+        return json_parse("{\"op\":\"create_table\",\"table\":\"orders\",\"columns\":["
+            "{\"name\":\"id\",\"type\":\"int\",\"primary\":true},"
+            "{\"name\":\"user_id\",\"type\":\"int\"},"
+            "{\"name\":\"total\",\"type\":\"real\"}]}");
+    if (strstr(u, "create") || strstr(u, "new table"))
         return json_parse("{\"op\":\"create_table\",\"table\":\"users\",\"columns\":["
             "{\"name\":\"id\",\"type\":\"int\",\"primary\":true},"
             "{\"name\":\"name\",\"type\":\"text\"},"
-            "{\"name\":\"age\",\"type\":\"int\"}]}");
-    if (strstr(u, "insert"))
-        return json_parse("{\"op\":\"insert\",\"table\":\"users\",\"values\":{\"name\":\"alice\",\"age\":30}}");
+            "{\"name\":\"age\",\"type\":\"int\"},"
+            "{\"name\":\"city\",\"type\":\"text\"}]}");
+
+    if ((strstr(u, "order") || strstr(u, "one ")) && (strstr(u, "for") && strstr(u, "worth"))) {
+        /* "an order for <name> worth <n>" -> insert into orders */
+        double uid = -1, total = 0;
+        /* extract name between "for " and " worth " (or ",") */
+        const char *f = strstr(u, "for ");
+        if (f) {
+            const char *end = strstr(f + 4, " worth");
+            char nm[128];
+            if (!end) end = f + 4;
+            snprintf(nm, (size_t)(end - (f + 4) + 1), "%s", f + 4);
+            char *tr = trim(nm);
+            uid = fake_user_id(tr);
+        }
+        const char *w = strstr(u, "worth ");
+        if (w) {
+            char num[64];
+            int i = 0;
+            while (w[6 + i] && (w[6 + i] >= '0' && w[6 + i] <= '9') && i < 63) { num[i] = w[6 + i]; i++; }
+            num[i] = 0;
+            total = atof(num);
+        }
+        snprintf(tmp, sizeof tmp,
+                 "{\"op\":\"insert\",\"table\":\"orders\",\"values\":{\"user_id\":%.0f,\"total\":%g}}",
+                 uid, total);
+        return json_parse(tmp);
+    }
+    if (strstr(u, "add column") || strstr(u, "new column"))
+        return json_parse("{\"op\":\"alter_table\",\"table\":\"users\",\"action\":\"add_column\",\"column\":{\"name\":\"email\",\"type\":\"text\"}}");
+    if (strstr(u, "insert") || strstr(u, "add ") || strstr(u, "add a"))
+        return json_parse("{\"op\":\"insert\",\"table\":\"users\",\"values\":{\"name\":\"alice\",\"age\":30,\"city\":\"nyc\"}}");
     if (strstr(u, "update"))
         return json_parse("{\"op\":\"update\",\"table\":\"users\",\"values\":{\"age\":31},\"where\":{\"name\":\"alice\"}}");
     if (strstr(u, "delete"))
         return json_parse("{\"op\":\"delete\",\"table\":\"users\",\"where\":{\"age\":{\"gt\":40}}}");
+    if (strstr(u, "batch"))
+        return json_parse("{\"ops\":[{\"op\":\"insert\",\"table\":\"users\",\"values\":{\"name\":\"eve\",\"age\":29,\"city\":\"la\"}},{\"op\":\"insert\",\"table\":\"users\",\"values\":{\"name\":\"frank\",\"age\":35,\"city\":\"nyc\"}}]}");
+    if (strstr(u, "join") || strstr(u, "with the buyer") || strstr(u, "customer name"))
+        return json_parse("{\"op\":\"select\",\"table\":\"orders\",\"join\":{\"table\":\"users\",\"on\":{\"users.id\":\"orders.user_id\"}},\"columns\":[\"users.name\",\"orders.total\"],\"where\":{\"orders.total\":{\"gt\":50}},\"order_by\":[{\"column\":\"orders.total\",\"desc\":true}]}");
+    if (strstr(u, "average") || strstr(u, "avg") || strstr(u, "sum") || strstr(u, "per city") || strstr(u, "per town"))
+        return json_parse("{\"op\":\"aggregate\",\"table\":\"users\",\"group_by\":[\"city\"],\"aggs\":[{\"as\":\"n\",\"func\":\"count\",\"column\":\"*\"},{\"as\":\"avg_age\",\"func\":\"avg\",\"column\":\"age\"}]}");
+    if (strstr(u, "starts with") || strstr(u, "begins"))
+        return json_parse("{\"op\":\"select\",\"table\":\"users\",\"where\":{\"name\":{\"like\":\"a%\"}}}");
+    if (strstr(u, "between"))
+        return json_parse("{\"op\":\"select\",\"table\":\"users\",\"where\":{\"age\":{\"between\":[25,30]}}}");
     if (strstr(u, "table")) /* describe / list tables */
         return json_parse("{\"op\":\"show_tables\"}");
     return json_parse("{\"op\":\"select\",\"table\":\"users\",\"columns\":\"*\",\"order_by\":[{\"column\":\"age\",\"desc\":true}]}");
 }
 
+/* multi-turn memory: remember the last few (request -> plan) pairs so
+ * follow-ups like "and those older than 40" can build on previous turns. */
+#define HISTORY_MAX 6
+static char history[HISTORY_MAX][1024];
+static int hist_n = 0, hist_head = 0;
+
+static void history_add(const char *stmt, const char *planjson)
+{
+    size_t n = strlen(stmt) + strlen(planjson) + 64;
+    if (n >= sizeof history[0]) return;
+    snprintf(history[hist_head], sizeof history[hist_head],
+             "user: \"%s\"\n  -> %s", stmt, planjson);
+    hist_head = (hist_head + 1) % HISTORY_MAX;
+    if (hist_n < HISTORY_MAX) hist_n++;
+}
+
+static void history_prompt(char *buf, int buflen)
+{
+    buf[0] = 0;
+    if (hist_n == 0) return;
+    strncat(buf, "Recent conversation (context for follow-up requests like \"and the older ones\" - do NOT re-execute past requests):\n", buflen - strlen(buf) - 1);
+    for (int i = 0; i < hist_n; i++) {
+        int idx = (hist_head - hist_n + i + HISTORY_MAX) % HISTORY_MAX;
+        if (history[idx][0]) {
+            strncat(buf, history[idx], buflen - strlen(buf) - 1);
+            strncat(buf, "\n", buflen - strlen(buf) - 1);
+        }
+    }
+}
+
 static void run_statement(const char *stmt)
 {
     char *schema = db_schema_prompt(&db);
+    char conv[4096];
+    history_prompt(conv, sizeof conv);
 
-    char sysprompt[16384];
-    snprintf(sysprompt, sizeof sysprompt, LLM_RULES, schema);
+    char *sysprompt = malloc(16384 + 4096 + strlen(conv) + 64);
+    snprintf(sysprompt, (size_t)(16384 + 4096 + strlen(conv) + 64),
+             "%s\n%s\n%s", LLM_RULES, conv, schema);
     free(schema);
 
     char *base  = getenv("ISQL_BASE");
@@ -202,6 +336,7 @@ static void run_statement(const char *stmt)
     if (!model) model = "gpt-4o-mini";
 
     JsonValue *plan = NULL;
+    JsonValue *res = NULL;
     if (getenv("ISQL_FAKE_LLM")) {
         printf("[fake-llm] %s\n", stmt);
         plan = fake_parse(stmt);
@@ -210,10 +345,12 @@ static void run_statement(const char *stmt)
         if (r.error) {
             printf("LLM error: %s\n", r.error);
             free(r.error);
+            free(sysprompt);
             return;
         }
         plan = json_parse(r.content);
         free(r.content);
+        free(sysprompt);
     }
 
     if (!plan) {
@@ -221,28 +358,18 @@ static void run_statement(const char *stmt)
         return;
     }
 
-    /* execute single op or a batch of ops */
-    JsonValue *ops = json_obj_get(plan, "ops");
-    int batch = (ops && ops->type == JSON_ARR);
-    if (!batch) {
-        JsonValue *res = db_exec(&db, plan);
-        print_result(res);
-        if (json_obj_get(res, "ok")) {
-            const char *err = db_save(&db);
-            if (err) printf("WARNING: cannot save: %s\n", err);
-        }
-        json_free(res);
-    } else {
-        for (int i = 0; i < ops->nelems; i++) {
-            JsonValue *res = db_exec(&db, ops->elems[i]);
-            print_result(res);
-            if (json_obj_get(res, "ok")) {
-                const char *err = db_save(&db);
-                if (err) printf("WARNING: cannot save: %s\n", err);
-            }
-            json_free(res);
-        }
+    res = db_exec(&db, plan);
+    print_result(res);
+    if (res_is_ok(res)) {
+        const char *err = db_save(&db);
+        if (err) printf("WARNING: cannot save: %s\n", err);
     }
+
+    /* remember this exchange for follow-up questions */
+    char *planjson = json_to_string(plan);
+    history_add(stmt, planjson);
+    free(planjson);
+    json_free(res);
     json_free(plan);
 }
 
@@ -260,7 +387,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    printf("isql 0.1 - AI-driven minimal database\n"
+    printf("isql 0.2 - AI-driven minimal database\n"
            "  base : %s\n  model: %s\n  db   : %s\n"
            "  type 'help' for usage, 'exit' to quit\n\n",
            getenv("ISQL_BASE") ? getenv("ISQL_BASE") : "https://api.openai.com/v1",

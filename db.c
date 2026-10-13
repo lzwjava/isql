@@ -94,6 +94,41 @@ static const char *table_name(const JsonValue *tbl)
     return (n && n->type == JSON_STR) ? n->str : "?";
 }
 
+/* resolve a column reference. "name" resolves to the key literally; if that
+ * fails and the reference is qualified as "table.col", try the bare name
+ * (joined rows expose right-table columns with a "table.col" prefix only
+ * when the bare name collides). */
+static JsonValue *row_get_qualified(const JsonValue *row, const char *spec)
+{
+    JsonValue *v = row ? json_obj_get(row, spec) : NULL;
+    if (v) return v;
+    const char *dot = strchr(spec, '.');
+    if (dot && row) v = json_obj_get(row, dot + 1);
+    return v;
+}
+
+/* SQL-style LIKE: '%' matches any sequence, '_' matches one character */
+static int like_match(const char *text, const char *pat)
+{
+    const char *t = text, *p = pat;
+    const char *star = NULL, *tt = NULL;
+    while (*t) {
+        if (*p == '%') { star = p++; tt = t; continue; }
+        if (*p && (*p == '_' || *p == *t)) { p++; t++; continue; }
+        if (star) { p = star + 1; t = ++tt; continue; }
+        return 0;
+    }
+    while (*p == '%') p++;
+    return *p == 0;
+}
+
+static int result_is_ok(const JsonValue *res)
+{
+    if (!res) return 0;
+    JsonValue *ok = json_obj_get(res, "ok");
+    return ok && ok->type == JSON_BOOL && ok->boolean;
+}
+
 /* ================================================================ */
 /* results                                                           */
 /* ================================================================ */
@@ -132,12 +167,13 @@ static JsonValue *result_err(const char *msg)
 
 static int pair_matches(const char *col, const JsonValue *cond, const JsonValue *row)
 {
-    JsonValue *cell = row ? json_obj_get(row, col) : NULL;
+    JsonValue *cell = row ? row_get_qualified(row, col) : NULL;
     if (cond && cond->type == JSON_OBJ) {
-        const char *ops[] = { "gt", "gte", "lt", "lte", "ne", NULL };
+        const char *ops[] = { "gt", "gte", "lt", "lte", "ne", "in", "like", "between", NULL };
         for (int i = 0; ops[i]; i++) {
             JsonValue *cv = json_obj_get(cond, ops[i]);
-            if (cv) {
+            if (!cv) continue;
+            if (i <= 4) {
                 int c = cell_cmp(cell, cv);
                 switch (i) {
                 case 0: return c > 0;   /* gt  */
@@ -147,8 +183,27 @@ static int pair_matches(const char *col, const JsonValue *cond, const JsonValue 
                 default: return c != 0; /* ne  */
                 }
             }
+            if (i == 5) { /* in: cv is an array of candidate values */
+                if (cv->type != JSON_ARR) return 0;
+                for (int k = 0; k < cv->nelems; k++)
+                    if (cell_cmp(cell, cv->elems[k]) == 0) return 1;
+                return 0;
+            }
+            if (i == 6) { /* like: cv is a pattern using % and _ */
+                if (cv->type != JSON_STR) return 0;
+                if (!cell || cell->type == JSON_NULL) return 0;
+                char buf[256];
+                if (strchr(cv->str, '%') || strchr(cv->str, '_'))
+                    return like_match(cell_text(cell, buf, sizeof buf), cv->str);
+                return cell_cmp(cell, cv) == 0; /* no wildcard -> equality */
+            }
+            if (i == 7) { /* between: cv == [lo, hi] */
+                if (cv->type != JSON_ARR || cv->nelems < 2) return 0;
+                return cell_cmp(cell, cv->elems[0]) >= 0 && cell_cmp(cell, cv->elems[1]) <= 0;
+            }
         }
     }
+    /* plain value -> equality; missing cell is NULL */
     return cell_cmp(cell, cond) == 0;
 }
 
@@ -354,47 +409,30 @@ static JsonValue *op_insert(Database *db, JsonValue *op)
     return result_ok(msg, 1);
 }
 
-/* which columns does the SELECT return?
- * returns (a) the table's full columns array for "*",
- *         (b) a validated array of column-name strings, or
- *         (c) NULL with *err set. */
-static JsonValue *select_column_spec(JsonValue *t, JsonValue *spec, int *all_cols, const char **err)
-{
-    *err = NULL;
-    *all_cols = 0;
-    JsonValue *cols = (JsonValue *)cols_of(t);
-    if (!spec || (spec->type == JSON_STR && spec->str[0] == '*')) {
-        *all_cols = 1;
-        return cols;
-    }
-    if (spec->type != JSON_ARR) {
-        *err = "select: 'columns' must be '*' or an array of names";
-        return NULL;
-    }
-    for (int i = 0; i < spec->nelems; i++) {
-        JsonValue *cn = spec->elems[i];
-        if (!cn || cn->type != JSON_STR || strcmp(cn->str, "*") == 0 || !find_column(t, cn->str)) {
-            *err = "select: unknown column in 'columns'";
-            return NULL;
-        }
-    }
-    return spec;
-}
-
-/* returns a new array of row objects matching `where` */
-static JsonValue *filter_rows(JsonValue *t, JsonValue *where)
+/* returns a new array of *clones* of the rows matching `where`. The caller owns
+ * the array and everything in it. */
+static JsonValue *all_rows_owned(JsonValue *t)
 {
     JsonValue *rows = rows_of(t);
     JsonValue *out = json_arr();
-    for (int i = 0; i < rows->nelems; i++) {
-        JsonValue *r = rows->elems[i];
-        if (cond_matches(where, r))
-            json_arr_push(out, r);
-    }
+    for (int i = 0; i < rows->nelems; i++)
+        json_arr_push(out, json_clone(rows->elems[i]));
     return out;
 }
 
-/* stable insertion sort by the order_by entries */
+static JsonValue *filter_rows_owned(JsonValue *src, JsonValue *where)
+{
+    if (!where || where->type == JSON_NULL) return src; /* caller keeps ownership */
+    JsonValue *out = json_arr();
+    for (int i = 0; i < src->nelems; i++)
+        if (cond_matches(where, src->elems[i]))
+            json_arr_push(out, src->elems[i]);
+    src->nelems = 0;
+    json_free(src);
+    return out;
+}
+
+/* stable insertion sort by the order_by entries (columns may be qualified) */
 static void sort_rows(JsonValue *matched, JsonValue *ord)
 {
     for (int i = 1; i < matched->nelems; i++) {
@@ -409,8 +447,8 @@ static void sort_rows(JsonValue *matched, JsonValue *ord)
                 if (!c || c->type != JSON_STR) continue;
                 JsonValue *dv = json_obj_get(o, "desc");
                 desc = dv && dv->type == JSON_BOOL && dv->boolean;
-                JsonValue *a = json_obj_get(matched->elems[j], c->str);
-                JsonValue *b = json_obj_get(key, c->str);
+                JsonValue *a = row_get_qualified(matched->elems[j], c->str);
+                JsonValue *b = row_get_qualified(key, c->str);
                 int cj = cell_cmp(a, b);
                 if (cj != 0) { cmp = cj; break; }
             }
@@ -424,6 +462,145 @@ static void sort_rows(JsonValue *matched, JsonValue *ord)
     }
 }
 
+/* ---------------------------------------------------------------- */
+/* INNER JOIN                                                        */
+/* ---------------------------------------------------------------- */
+
+/* merge right into a clone of left; right columns whose bare name already
+ * exists on the left are exposed as "<rtable>.<col>". */
+static JsonValue *merge_rows(const JsonValue *left, const JsonValue *right, const char *rtable)
+{
+    JsonValue *out = json_clone(left);
+    for (int i = 0; i < right->npairs; i++) {
+        const char *k = right->pairs[i].key;
+        char prefixed[256];
+        if (json_obj_get(out, k)) {
+            snprintf(prefixed, sizeof prefixed, "%s.%s", rtable, k);
+            k = prefixed;
+        }
+        json_obj_set(out, k, json_clone(right->pairs[i].val));
+    }
+    return out;
+}
+
+/* last component of "table.col" -> "col" (bare names returned as-is) */
+static const char *bare_name(const char *spec)
+{
+    const char *dot = strchr(spec, '.');
+    return dot ? dot + 1 : spec;
+}
+
+/* resolve a join condition column reference: if it is qualified with
+ * "table.", use that table's row; otherwise try the left row first, then the
+ * right. The "on" map is symmetric, so either orientation works. */
+static JsonValue *resolve_in(JsonValue *l, JsonValue *r, const char *lname, const char *rname,
+                             const char *spec)
+{
+    const char *dot = strchr(spec, '.');
+    if (dot) {
+        const char *qual = spec;
+        const char *bare = dot + 1;
+        /* qualifier is a byte-exact prefix of the table name */
+        JsonValue *v;
+        if (strncmp(qual, lname, (size_t)(dot - spec)) == 0 &&
+            (strlen(lname) == (size_t)(dot - spec))) {
+            v = json_obj_get(l, bare);
+            if (v) return v;
+            v = json_obj_get(r, bare);
+            return v;
+        }
+        v = json_obj_get(r, bare);
+        if (v) return v;
+        return json_obj_get(l, bare);
+    }
+    JsonValue *v = json_obj_get(l, spec);
+    if (v) return v;
+    return json_obj_get(r, spec);
+}
+
+/* INNER JOIN: every (left row, right row) pair where ALL "on" equalities hold. */
+static JsonValue *inner_join_rows(JsonValue *lt, JsonValue *rt, JsonValue *on)
+{
+    JsonValue *out = json_arr();
+    const char *ltname = table_name(lt), *rtname = table_name(rt);
+    JsonValue *lrows = rows_of(lt), *rrows = rows_of(rt);
+    for (int li = 0; li < lrows->nelems; li++) {
+        JsonValue *l = lrows->elems[li];
+        for (int ri = 0; ri < rrows->nelems; ri++) {
+            JsonValue *r = rrows->elems[ri];
+            int ok = 1;
+            for (int p = 0; p < on->npairs; p++) {
+                JsonValue *rv = on->pairs[p].val;
+                if (!rv || rv->type != JSON_STR) { ok = 0; break; }
+                JsonValue *a = resolve_in(l, r, ltname, rtname, on->pairs[p].key);
+                JsonValue *b = resolve_in(l, r, ltname, rtname, rv->str);
+                if (cell_cmp(a, b) != 0) { ok = 0; break; }
+            }
+            if (ok) json_arr_push(out, merge_rows(l, r, rtname));
+        }
+    }
+    return out;
+}
+
+/* column names visible on the joined rows (for validation / "*"), in order */
+static JsonValue *joined_column_names(JsonValue *lt, JsonValue *rt)
+{
+    JsonValue *names = json_arr();
+    const char *rtname = table_name(rt);
+    JsonValue *lcols = (JsonValue *)cols_of(lt);
+    JsonValue *rcols = (JsonValue *)cols_of(rt);
+    for (int i = 0; i < lcols->nelems; i++)
+        json_arr_push(names, json_str(col_name(lcols->elems[i])));
+    for (int i = 0; i < rcols->nelems; i++) {
+        const char *n = col_name(rcols->elems[i]);
+        int dup = 0;
+        for (int j = 0; j < names->nelems; j++)
+            if (strcmp(names->elems[j]->str, n) == 0) { dup = 1; break; }
+        if (dup) {
+            char p[256];
+            snprintf(p, sizeof p, "%s.%s", rtname, n);
+            json_arr_push(names, json_str(p));
+        } else {
+            json_arr_push(names, json_str(n));
+        }
+    }
+    return names;
+}
+
+static int name_known(JsonValue *names, const char *spec)
+{
+    for (int i = 0; i < names->nelems; i++)
+        if (strcmp(names->elems[i]->str, spec) == 0) return 1;
+    const char *dot = strchr(spec, '.');
+    if (dot) {
+        for (int i = 0; i < names->nelems; i++)
+            if (strcmp(names->elems[i]->str, dot + 1) == 0) return 1;
+    }
+    return 0;
+}
+
+/* drop duplicate output rows (used for SELECT DISTINCT) */
+static void dedupe_rows(JsonValue *rows)
+{
+    JsonValue *seen = json_arr();
+    int w = 0;
+    for (int r = 0; r < rows->nelems; r++) {
+        char *key = json_to_string(rows->elems[r]);
+        int dup = 0;
+        for (int s = 0; s < seen->nelems; s++)
+            if (strcmp(seen->elems[s]->str, key) == 0) { dup = 1; break; }
+        if (dup) {
+            json_free(rows->elems[r]);
+        } else {
+            json_arr_push(seen, json_str(key));
+            rows->elems[w++] = rows->elems[r];
+        }
+        free(key);
+    }
+    rows->nelems = w;
+    json_free(seen);
+}
+
 static JsonValue *op_select(Database *db, JsonValue *op)
 {
     JsonValue *nv = json_obj_get(op, "table");
@@ -431,59 +608,82 @@ static JsonValue *op_select(Database *db, JsonValue *op)
     JsonValue *t = find_table(db, nv->str);
     if (!t) return result_err("select: no such table");
 
-    const char *err = NULL;
-    int all_cols = 0;
-    JsonValue *spec = select_column_spec(t, json_obj_get(op, "columns"), &all_cols, &err);
-    if (err) return result_err(err);
+    JsonValue *join = json_obj_get(op, "join");
+    JsonValue *src = NULL;
+    JsonValue *allnames = NULL;
 
-    JsonValue *matched = filter_rows(t, json_obj_get(op, "where"));
+    if (join && join->type == JSON_OBJ) {
+        JsonValue *jn = json_obj_get(join, "table");
+        if (!jn || jn->type != JSON_STR) return result_err("select: join is missing 'table'");
+        JsonValue *jt = find_table(db, jn->str);
+        if (!jt) return result_err("select: join table not found");
+        JsonValue *on = json_obj_get(join, "on");
+        if (!on || on->type != JSON_OBJ) return result_err("select: join requires an 'on' object");
+        src = inner_join_rows(t, jt, on);
+        allnames = joined_column_names(t, jt);
+    } else {
+        JsonValue *cols = (JsonValue *)cols_of(t);
+        allnames = json_arr();
+        for (int i = 0; i < cols->nelems; i++)
+            json_arr_push(allnames, json_str(col_name(cols->elems[i])));
+        src = all_rows_owned(t);
+    }
+    /* WHERE applies after the join (SQL semantics) */
+    src = filter_rows_owned(src, json_obj_get(op, "where"));
 
     JsonValue *ord = json_obj_get(op, "order_by");
     if (ord && ord->type == JSON_ARR && ord->nelems > 0)
-        sort_rows(matched, ord);
+        sort_rows(src, ord);
 
     JsonValue *lim = json_obj_get(op, "limit");
-    int limit = (lim && lim->type == JSON_NUM && lim->num >= 0) ? (int)lim->num : matched->nelems;
-    if (limit > matched->nelems) limit = matched->nelems;
+    int limit = (lim && lim->type == JSON_NUM && lim->num >= 0) ? (int)lim->num : src->nelems;
+    if (limit > src->nelems) limit = src->nelems;
 
-    JsonValue *cols = (JsonValue *)cols_of(t);
-    JsonValue *columns = json_arr();
+    /* which columns to project */
+    JsonValue *spec = json_obj_get(op, "columns");
+    int all_cols = (!spec || (spec->type == JSON_STR && spec->str[0] == '*'));
+    JsonValue *colnames = NULL;
     if (all_cols) {
-        for (int i = 0; i < cols->nelems; i++)
-            json_arr_push(columns, json_str(col_name(cols->elems[i])));
+        colnames = allnames; /* ownership moves into the result */
+        allnames = NULL;
     } else {
-        for (int i = 0; i < spec->nelems; i++) {
-            if (spec->elems[i]->type != JSON_STR) continue;
-            json_arr_push(columns, json_str(spec->elems[i]->str));
+        if (spec->type != JSON_ARR) {
+            json_free(allnames); json_free(src);
+            return result_err("select: 'columns' must be '*' or an array of names");
         }
+        colnames = json_arr();
+        for (int i = 0; i < spec->nelems; i++) {
+            JsonValue *e = spec->elems[i];
+            if (!e || e->type != JSON_STR || !name_known(allnames, e->str)) {
+                json_free(allnames); json_free(colnames); json_free(src);
+                return result_err("select: unknown column in 'columns'");
+            }
+            json_arr_push(colnames, json_str(e->str));
+        }
+        json_free(allnames);
     }
 
+    /* materialize projected rows */
     JsonValue *rowobjs = json_arr();
     for (int i = 0; i < limit; i++) {
-        JsonValue *src = matched->elems[i];
+        JsonValue *srow = src->elems[i];
         JsonValue *r = json_obj();
-        if (all_cols) {
-            for (int j = 0; j < cols->nelems; j++) {
-                const char *cn = col_name(cols->elems[j]);
-                JsonValue *cell = json_obj_get(src, cn);
-                json_obj_set(r, cn, cell ? json_clone(cell) : json_null());
-            }
-        } else {
-            for (int j = 0; j < spec->nelems; j++) {
-                if (spec->elems[j]->type != JSON_STR) continue;
-                const char *cn = spec->elems[j]->str;
-                JsonValue *cell = json_obj_get(src, cn);
-                json_obj_set(r, cn, cell ? json_clone(cell) : json_null());
-            }
+        for (int j = 0; j < colnames->nelems; j++) {
+            const char *cn = colnames->elems[j]->str;
+            JsonValue *cell = row_get_qualified(srow, cn);
+            json_obj_set(r, cn, cell ? json_clone(cell) : json_null());
         }
         json_arr_push(rowobjs, r);
     }
-    matched->nelems = 0; /* matched is a view over table rows: don't free the rows */
-    json_free(matched);
+    json_free(src);
+
+    JsonValue *dv = json_obj_get(op, "distinct");
+    if (dv && dv->type == JSON_BOOL && dv->boolean)
+        dedupe_rows(rowobjs);
 
     char msg[96];
     snprintf(msg, sizeof msg, "Fetched %d row(s) from '%s'", rowobjs->nelems, table_name(t));
-    return result_rows(rowobjs, columns, msg);
+    return result_rows(rowobjs, colnames, msg);
 }
 
 static JsonValue *op_update(Database *db, JsonValue *op)
@@ -594,6 +794,265 @@ static JsonValue *op_describe(Database *db, JsonValue *op)
 }
 
 /* ================================================================ */
+/* AGGREGATE                                                          */
+/* ================================================================ */
+
+static JsonValue *compute_agg(JsonValue *grows, JsonValue *agg)
+{
+    JsonValue *fn = json_obj_get(agg, "func");
+    JsonValue *colv = json_obj_get(agg, "column");
+    if (!fn || fn->type != JSON_STR) return json_null();
+    const char *func = fn->str;
+    const char *col = (colv && colv->type == JSON_STR) ? colv->str : "*";
+
+    if (strcmp(func, "count") == 0) {
+        if (col[0] == '*') return json_num(grows->nelems);
+        int n = 0;
+        for (int i = 0; i < grows->nelems; i++) {
+            JsonValue *cell = row_get_qualified(grows->elems[i], col);
+            if (cell && cell->type != JSON_NULL) n++;
+        }
+        return json_num(n);
+    }
+    if (strcmp(func, "sum") == 0 || strcmp(func, "avg") == 0) {
+        double total = 0;
+        int n = 0;
+        for (int i = 0; i < grows->nelems; i++) {
+            double d;
+            JsonValue *cell = col[0] == '*' ? NULL : row_get_qualified(grows->elems[i], col);
+            if (cell && json_is_num_or_numeric_string(cell, &d)) { total += d; n++; }
+        }
+        return json_num(strcmp(func, "avg") == 0 ? (n ? total / n : 0) : total);
+    }
+    if (strcmp(func, "min") == 0 || strcmp(func, "max") == 0) {
+        JsonValue *best = NULL;
+        for (int i = 0; i < grows->nelems; i++) {
+            JsonValue *cell = row_get_qualified(grows->elems[i], col);
+            if (!cell || cell->type == JSON_NULL) continue;
+            if (!best || (strcmp(func, "max") == 0 ? cell_cmp(cell, best) > 0 : cell_cmp(cell, best) < 0))
+                best = cell;
+        }
+        return best ? json_clone(best) : json_null();
+    }
+    return json_null();
+}
+
+static JsonValue *op_aggregate(Database *db, JsonValue *op)
+{
+    JsonValue *nv = json_obj_get(op, "table");
+    if (!nv || nv->type != JSON_STR) return result_err("aggregate: missing 'table'");
+    JsonValue *t = find_table(db, nv->str);
+    if (!t) return result_err("aggregate: no such table");
+
+    JsonValue *aggs = json_obj_get(op, "aggs");
+    if (!aggs || aggs->type != JSON_ARR || aggs->nelems == 0)
+        return result_err("aggregate: 'aggs' (array) is required");
+    for (int i = 0; i < aggs->nelems; i++) {
+        JsonValue *a = aggs->elems[i];
+        JsonValue *fn = a ? json_obj_get(a, "func") : NULL;
+        if (!fn || fn->type != JSON_STR) return result_err("aggregate: each agg needs a 'func' string");
+    }
+
+    JsonValue *gb = json_obj_get(op, "group_by");
+    int has_gb = gb && gb->type == JSON_ARR && gb->nelems > 0;
+    if (has_gb) {
+        for (int i = 0; i < gb->nelems; i++) {
+            JsonValue *g = gb->elems[i];
+            if (!g || g->type != JSON_STR || !find_column(t, g->str))
+                return result_err("aggregate: unknown column in 'group_by'");
+        }
+    }
+
+    JsonValue *rows = filter_rows_owned(all_rows_owned(t), json_obj_get(op, "where"));
+
+    /* group rows by the group-by values (keep encounter order) */
+    JsonValue *groups = json_arr(); /* elements: {key: str, rows: [clones]} */
+    for (int i = 0; i < rows->nelems; i++) {
+        char keybuf[1024];
+        keybuf[0] = 0;
+        if (has_gb) {
+            for (int g = 0; g < gb->nelems; g++) {
+                const char *gn = gb->elems[g]->str;
+                JsonValue *cell = json_obj_get(rows->elems[i], gn);
+                char b[64];
+                if (g) strcat(keybuf, "\x1f");
+                strncat(keybuf, cell ? cell_text(cell, b, sizeof b) : "NULL", sizeof keybuf - strlen(keybuf) - 1);
+            }
+        }
+        JsonValue *grp = NULL;
+        for (int g = 0; g < groups->nelems; g++) {
+            JsonValue *gk = json_obj_get(groups->elems[g], "key");
+            if (gk && gk->type == JSON_STR && strcmp(gk->str, keybuf) == 0) { grp = groups->elems[g]; break; }
+        }
+        if (!grp) {
+            grp = json_obj();
+            json_obj_set(grp, "key", json_str(has_gb ? keybuf : ""));
+            json_obj_set(grp, "rows", json_arr());
+            json_arr_push(groups, grp);
+        }
+        json_arr_push(json_obj_get(grp, "rows"), rows->elems[i]);
+    }
+    rows->nelems = 0;
+    json_free(rows);
+
+    /* if no rows at all and no groups, still emit one group so aggregate returns a row */
+    if (groups->nelems == 0) {
+        JsonValue *grp = json_obj();
+        json_obj_set(grp, "key", json_str(""));
+        json_obj_set(grp, "rows", json_arr());
+        json_arr_push(groups, grp);
+    }
+
+    /* output columns: group columns then each agg's "as" (fallback: func) */
+    JsonValue *colnames = json_arr();
+    if (has_gb)
+        for (int i = 0; i < gb->nelems; i++)
+            json_arr_push(colnames, json_str(gb->elems[i]->str));
+    for (int i = 0; i < aggs->nelems; i++) {
+        JsonValue *asv = json_obj_get(aggs->elems[i], "as");
+        JsonValue *fn = json_obj_get(aggs->elems[i], "func");
+        const char *nm = (asv && asv->type == JSON_STR) ? asv->str : fn->str;
+        json_arr_push(colnames, json_str(nm));
+    }
+
+    JsonValue *rowobjs = json_arr();
+    for (int g = 0; g < groups->nelems; g++) {
+        JsonValue *grp = groups->elems[g];
+        JsonValue *grows = json_obj_get(grp, "rows");
+        JsonValue *row = json_obj();
+        if (has_gb) {
+            JsonValue *rep = grows->nelems > 0 ? grows->elems[0] : NULL;
+            for (int i = 0; i < gb->nelems; i++) {
+                const char *gn = gb->elems[i]->str;
+                JsonValue *cell = rep ? json_obj_get(rep, gn) : NULL;
+                json_obj_set(row, gn, cell ? json_clone(cell) : json_null());
+            }
+        }
+        for (int i = 0; i < aggs->nelems; i++) {
+            JsonValue *asv = json_obj_get(aggs->elems[i], "as");
+            JsonValue *fn = json_obj_get(aggs->elems[i], "func");
+            const char *nm = (asv && asv->type == JSON_STR) ? asv->str : fn->str;
+            json_obj_set(row, nm, compute_agg(grows, aggs->elems[i]));
+        }
+        json_arr_push(rowobjs, row);
+        json_free(grp); /* groups no longer owns it: see detach below */
+    }
+    groups->nelems = 0; /* group objects already freed above */
+    json_free(groups);
+
+    char msg[96];
+    snprintf(msg, sizeof msg, "Aggregated %d group(s)", rowobjs->nelems);
+    return result_rows(rowobjs, colnames, msg);
+}
+
+/* ================================================================ */
+/* ALTER TABLE                                                       */
+/* ================================================================ */
+
+static JsonValue *op_alter_table(Database *db, JsonValue *op)
+{
+    JsonValue *nv = json_obj_get(op, "table");
+    if (!nv || nv->type != JSON_STR) return result_err("alter_table: missing 'table'");
+    JsonValue *t = find_table(db, nv->str);
+    if (!t) return result_err("alter_table: no such table");
+
+    JsonValue *av = json_obj_get(op, "action");
+    const char *action = (av && av->type == JSON_STR) ? av->str : "";
+
+    if (strcmp(action, "add_column") == 0) {
+        JsonValue *cv = json_obj_get(op, "column");
+        if (!cv || cv->type != JSON_OBJ) return result_err("alter_table: 'column' object required");
+        JsonValue *cn = json_obj_get(cv, "name");
+        if (!cn || cn->type != JSON_STR || cn->str[0] == 0) return result_err("alter_table: column missing 'name'");
+        if (find_column(t, cn->str)) return result_err("alter_table: column already exists");
+        JsonValue *ct = json_obj_get(cv, "type");
+        const char *ctype = (ct && ct->type == JSON_STR) ? ct->str : "text";
+        if (strcmp(ctype, "int") && strcmp(ctype, "real") && strcmp(ctype, "text"))
+            return result_err("alter_table: unknown column type");
+        JsonValue *col = json_obj();
+        json_obj_set(col, "name", json_str(cn->str));
+        json_obj_set(col, "type", json_str(ctype));
+        json_obj_set(col, "primary", json_bool(0));
+        JsonValue *cols = json_obj_get(t, "columns");
+        json_arr_push(cols, col);
+        char msg[96];
+        snprintf(msg, sizeof msg, "Added column '%s' to '%s'", cn->str, table_name(t));
+        return result_ok(msg, 0);
+    }
+
+    if (strcmp(action, "drop_column") == 0) {
+        JsonValue *cn = json_obj_get(op, "column");
+        const char *drop = (cn && cn->type == JSON_STR) ? cn->str : "";
+        if (!find_column(t, drop)) return result_err("alter_table: no such column");
+        JsonValue *cols = json_obj_get(t, "columns");
+        JsonValue *newcols = json_arr();
+        for (int i = 0; i < cols->nelems; i++) {
+            if (strcmp(col_name(cols->elems[i]), drop) == 0) continue;
+            json_arr_push(newcols, json_clone(cols->elems[i]));
+        }
+        json_obj_set(t, "columns", newcols); /* replaces; old columns freed by json_obj_set */
+        /* strip the key from every row */
+        JsonValue *rows = rows_of(t);
+        for (int i = 0; i < rows->nelems; i++) {
+            JsonValue *old = rows->elems[i];
+            JsonValue *nr = json_obj();
+            for (int p = 0; p < old->npairs; p++)
+                if (strcmp(old->pairs[p].key, drop) != 0)
+                    json_obj_set(nr, old->pairs[p].key, json_clone(old->pairs[p].val));
+            json_free(old);
+            rows->elems[i] = nr;
+        }
+        char msg[96];
+        snprintf(msg, sizeof msg, "Dropped column '%s' from '%s'", drop, table_name(t));
+        return result_ok(msg, 0);
+    }
+
+    return result_err("alter_table: 'action' must be add_column or drop_column");
+}
+
+/* ================================================================ */
+/* BATCH (all-or-nothing)                                            */
+/* ================================================================ */
+
+static JsonValue *op_batch(Database *db, JsonValue *ops)
+{
+    if (ops->nelems == 0) return result_ok("Nothing to execute", 0);
+    JsonValue *snapshot = json_clone(db->tables);
+    JsonValue *items = json_arr();
+    for (int i = 0; i < ops->nelems; i++) {
+        JsonValue *res = db_exec(db, ops->elems[i]);
+        json_arr_push(items, res);
+        if (!result_is_ok(res)) {
+            /* roll back: discard the mutated tables, restore the snapshot */
+            JsonValue *cur = db->tables;
+            db->tables = snapshot;
+            cur->nelems = 0;
+            json_free(cur);
+            JsonValue *out = json_obj();
+            json_obj_set(out, "ok", json_bool(0));
+            json_obj_set(out, "rolled_back", json_bool(1));
+            {
+                char msg[96];
+                snprintf(msg, sizeof msg, "Batch failed at op %d of %d - all changes rolled back", i + 1, ops->nelems);
+                json_obj_set(out, "message", json_str(msg));
+            }
+            json_obj_set(out, "items", items);
+            return out;
+        }
+    }
+    json_free(snapshot);
+    JsonValue *out = json_obj();
+    json_obj_set(out, "ok", json_bool(1));
+    {
+        char msg[96];
+        snprintf(msg, sizeof msg, "Executed %d op(s) in a batch", ops->nelems);
+        json_obj_set(out, "message", json_str(msg));
+    }
+    json_obj_set(out, "items", items);
+    return out;
+}
+
+/* ================================================================ */
 /* dispatcher                                                        */
 /* ================================================================ */
 
@@ -602,18 +1061,24 @@ JsonValue *db_exec(Database *db, JsonValue *op)
     if (!op || op->type != JSON_OBJ)
         return result_err("bad query plan: expected a JSON object");
     JsonValue *opv = json_obj_get(op, "op");
-    if (!opv || opv->type != JSON_STR)
+    if (!opv || opv->type != JSON_STR) {
+        /* a plan with an "ops" array is a batch */
+        JsonValue *opsv = json_obj_get(op, "ops");
+        if (opsv && opsv->type == JSON_ARR) return op_batch(db, opsv);
         return result_err("bad query plan: missing string field 'op'");
+    }
     const char *name = opv->str;
 
-    if (strcmp(name, "create_table") == 0) return op_create_table(db, op);
-    if (strcmp(name, "drop_table")   == 0) return op_drop_table(db, op);
-    if (strcmp(name, "insert")       == 0) return op_insert(db, op);
-    if (strcmp(name, "select")       == 0) return op_select(db, op);
-    if (strcmp(name, "update")       == 0) return op_update(db, op);
-    if (strcmp(name, "delete")       == 0) return op_delete(db, op);
-    if (strcmp(name, "show_tables")  == 0) return op_show_tables(db, op);
-    if (strcmp(name, "describe")     == 0) return op_describe(db, op);
+    if (strcmp(name, "create_table")  == 0) return op_create_table(db, op);
+    if (strcmp(name, "drop_table")    == 0) return op_drop_table(db, op);
+    if (strcmp(name, "insert")        == 0) return op_insert(db, op);
+    if (strcmp(name, "select")        == 0) return op_select(db, op);
+    if (strcmp(name, "update")        == 0) return op_update(db, op);
+    if (strcmp(name, "delete")        == 0) return op_delete(db, op);
+    if (strcmp(name, "aggregate")     == 0) return op_aggregate(db, op);
+    if (strcmp(name, "alter_table")   == 0) return op_alter_table(db, op);
+    if (strcmp(name, "show_tables")   == 0) return op_show_tables(db, op);
+    if (strcmp(name, "describe")      == 0) return op_describe(db, op);
     if (strcmp(name, "error")        == 0) {
         JsonValue *m = json_obj_get(op, "message");
         return result_err((m && m->type == JSON_STR) ? m->str

@@ -158,6 +158,117 @@ int main(void)
     json_free(r);
     remove(tmp);
 
+
+    /* ================= Phase 2: operators, JOIN, aggregate, ALTER, batch ===== */
+
+    /* --- new tables for phase 2 --- */
+    check(ok_code(run(&db, "{\"op\":\"create_table\",\"table\":\"users2\",\"columns\":[{\"name\":\"id\",\"type\":\"int\",\"primary\":true},{\"name\":\"name\",\"type\":\"text\"},{\"name\":\"age\",\"type\":\"int\"},{\"name\":\"city\",\"type\":\"text\"}]}")), "create users2");
+    r = run(&db, "{\"op\":\"insert\",\"table\":\"users2\",\"values\":{\"id\":1,\"name\":\"alice\",\"age\":30,\"city\":\"nyc\"}}"); json_free(r);
+    r = run(&db, "{\"op\":\"insert\",\"table\":\"users2\",\"values\":{\"id\":2,\"name\":\"bob\",\"age\":25,\"city\":\"sf\"}}"); json_free(r);
+    r = run(&db, "{\"op\":\"insert\",\"table\":\"users2\",\"values\":{\"id\":3,\"name\":\"carol\",\"age\":40,\"city\":\"nyc\"}}"); json_free(r);
+    r = run(&db, "{\"op\":\"insert\",\"table\":\"users2\",\"values\":{\"id\":4,\"name\":\"anna\",\"age\":22,\"city\":\"sf\"}}"); json_free(r);
+    r = run(&db, "{\"op\":\"insert\",\"table\":\"users2\",\"values\":{\"id\":5,\"name\":\"dave\",\"age\":28,\"city\":\"la\"}}"); json_free(r);
+
+    /* --- LIKE --- */
+    r = run(&db, "{\"op\":\"select\",\"table\":\"users2\",\"where\":{\"name\":{\"like\":\"a%\"}}}");
+    check(ok_code(r) && rows_of_result(r) == 2, "like 'a%' matches alice, anna");
+    json_free(r);
+    r = run(&db, "{\"op\":\"select\",\"table\":\"users2\",\"where\":{\"name\":{\"like\":\"_ob\"}}}");
+    check(ok_code(r) && rows_of_result(r) == 1, "like '_ob' matches bob");
+    json_free(r);
+
+    /* --- IN --- */
+    r = run(&db, "{\"op\":\"select\",\"table\":\"users2\",\"where\":{\"city\":{\"in\":[\"nyc\",\"la\"]}}}");
+    check(ok_code(r) && rows_of_result(r) == 3, "city in [nyc,la] -> 3");
+    json_free(r);
+
+    /* --- BETWEEN --- */
+    r = run(&db, "{\"op\":\"select\",\"table\":\"users2\",\"where\":{\"age\":{\"between\":[25,30]}}}");
+    check(ok_code(r) && rows_of_result(r) == 3, "age between 25 and 30 -> 3");
+    json_free(r);
+
+    /* --- DISTINCT --- */
+    r = run(&db, "{\"op\":\"select\",\"table\":\"users2\",\"columns\":[\"city\"],\"distinct\":true}");
+    check(ok_code(r) && rows_of_result(r) == 3, "distinct city -> 3");
+    json_free(r);
+
+    /* --- ALTER add + drop column --- */
+    r = run(&db, "{\"op\":\"alter_table\",\"table\":\"users2\",\"action\":\"add_column\",\"column\":{\"name\":\"email\",\"type\":\"text\"}}");
+    check(ok_code(r), "alter add_column ok");
+    json_free(r);
+    r = run(&db, "{\"op\":\"update\",\"table\":\"users2\",\"values\":{\"email\":\"a@x.com\"},\"where\":{\"name\":\"alice\"}}");
+    check(ok_code(r), "update new column ok");
+    json_free(r);
+    r = run(&db, "{\"op\":\"select\",\"table\":\"users2\",\"where\":{\"email\":\"a@x.com\"}}");
+    check(ok_code(r) && rows_of_result(r) == 1, "filter on new column works");
+    json_free(r);
+    r = run(&db, "{\"op\":\"alter_table\",\"table\":\"users2\",\"action\":\"drop_column\",\"column\":\"email\"}");
+    check(ok_code(r), "alter drop_column ok");
+    json_free(r);
+    r = run(&db, "{\"op\":\"select\",\"table\":\"users2\",\"columns\":[\"email\"]}");
+    check(!ok_code(r), "dropped column no longer selectable");
+    json_free(r);
+
+    /* --- AGGREGATE --- */
+    r = run(&db, "{\"op\":\"aggregate\",\"table\":\"users2\",\"aggs\":[{\"as\":\"n\",\"func\":\"count\",\"column\":\"*\"},{\"as\":\"total\",\"func\":\"sum\",\"column\":\"age\"},{\"as\":\"avg\",\"func\":\"avg\",\"column\":\"age\"},{\"as\":\"oldest\",\"func\":\"max\",\"column\":\"age\"}]}");
+    check(ok_code(r) && rows_of_result(r) == 1, "aggregate no group -> 1 row");
+    JsonValue *a0 = rows_of_result(r) > 0 ? json_obj_get(json_obj_get(r, "rows")->elems[0], "n") : NULL;
+    JsonValue *a1 = rows_of_result(r) > 0 ? json_obj_get(json_obj_get(r, "rows")->elems[0], "total") : NULL;
+    JsonValue *a2 = rows_of_result(r) > 0 ? json_obj_get(json_obj_get(r, "rows")->elems[0], "oldest") : NULL;
+    check(a0 && a0->num == 5, "count(*) == 5");
+    check(a1 && a1->num == 145, "sum(age) == 145");
+    check(a2 && a2->num == 40, "max(age) == 40");
+    json_free(r);
+
+    r = run(&db, "{\"op\":\"aggregate\",\"table\":\"users2\",\"group_by\":[\"city\"],\"aggs\":[{\"as\":\"n\",\"func\":\"count\",\"column\":\"*\"},{\"as\":\"avg\",\"func\":\"avg\",\"column\":\"age\"}]}");
+    check(ok_code(r) && rows_of_result(r) == 3, "aggregate group by city -> 3 groups");
+    json_free(r);
+    /* empty table aggregate returns 0 on count */
+    r = run(&db, "{\"op\":\"create_table\",\"table\":\"empty\",\"columns\":[{\"name\":\"x\",\"type\":\"int\"}]}");
+    json_free(r);
+    r = run(&db, "{\"op\":\"aggregate\",\"table\":\"empty\",\"aggs\":[{\"as\":\"n\",\"func\":\"count\",\"column\":\"*\"}]}");
+    JsonValue *n0 = rows_of_result(r) > 0 ? json_obj_get(json_obj_get(r, "rows")->elems[0], "n") : NULL;
+    check(ok_code(r) && n0 && n0->num == 0, "count on empty table == 0");
+    json_free(r);
+
+    /* --- JOIN --- */
+    check(ok_code(run(&db, "{\"op\":\"create_table\",\"table\":\"orders\",\"columns\":[{\"name\":\"id\",\"type\":\"int\",\"primary\":true},{\"name\":\"user_id\",\"type\":\"int\"},{\"name\":\"total\",\"type\":\"real\"}]}")), "create orders");
+    r = run(&db, "{\"op\":\"insert\",\"table\":\"orders\",\"values\":{\"id\":1,\"user_id\":1,\"total\":150.0}}"); json_free(r);
+    r = run(&db, "{\"op\":\"insert\",\"table\":\"orders\",\"values\":{\"id\":2,\"user_id\":1,\"total\":30.0}}"); json_free(r);
+    r = run(&db, "{\"op\":\"insert\",\"table\":\"orders\",\"values\":{\"id\":3,\"user_id\":3,\"total\":90.0}}"); json_free(r);
+    r = run(&db, "{\"op\":\"insert\",\"table\":\"orders\",\"values\":{\"id\":4,\"user_id\":99,\"total\":500.0}}"); json_free(r);
+
+    r = run(&db, "{\"op\":\"select\",\"table\":\"orders\",\"join\":{\"table\":\"users2\",\"on\":{\"users2.id\":\"orders.user_id\"}},\"columns\":[\"users2.name\",\"orders.total\"]}");
+    check(ok_code(r) && rows_of_result(r) == 3, "inner join -> 3 rows (user 99 has no match)");
+    JsonValue *jr = rows_of_result(r) > 0 ? json_obj_get(json_obj_get(r, "rows")->elems[0], "users2.name") : NULL;
+    check(jr && jr->type == JSON_STR && strcmp(jr->str, "alice") == 0, "join first row name = alice");
+    json_free(r);
+
+    /* join + where on joined columns + order */
+    r = run(&db, "{\"op\":\"select\",\"table\":\"orders\",\"join\":{\"table\":\"users2\",\"on\":{\"users2.id\":\"orders.user_id\"}},\"columns\":[\"users2.name\",\"orders.total\"],\"where\":{\"orders.total\":{\"gt\":80}},\"order_by\":[{\"column\":\"orders.total\",\"desc\":true}]}");
+    check(ok_code(r) && rows_of_result(r) == 2, "join where total>80 -> 2");
+    JsonValue *jtop = rows_of_result(r) > 0 ? json_obj_get(json_obj_get(r, "rows")->elems[0], "orders.total") : NULL;
+    check(jtop && jtop->type == JSON_NUM && jtop->num == 150, "join order by total desc -> 150 first");
+    json_free(r);
+
+    /* --- BATCH: success keeps changes --- */
+    r = run(&db, "{\"ops\":[{\"op\":\"insert\",\"table\":\"orders\",\"values\":{\"id\":5,\"user_id\":2,\"total\":10.0}},{\"op\":\"insert\",\"table\":\"orders\",\"values\":{\"id\":6,\"user_id\":4,\"total\":20.0}}]}");
+    check(ok_code(r) && r->npairs && json_obj_get(r, "items") != NULL, "batch ok has items");
+    json_free(r);
+    r = run(&db, "{\"op\":\"select\",\"table\":\"orders\"}");
+    check(ok_code(r) && rows_of_result(r) == 6, "after successful batch -> 6 orders");
+    json_free(r);
+
+    /* --- BATCH: on failure rolls back the earlier op --- */
+    r = run(&db, "{\"ops\":[{\"op\":\"insert\",\"table\":\"orders\",\"values\":{\"id\":7,\"user_id\":1,\"total\":1.0}},{\"op\":\"insert\",\"table\":\"orders\",\"values\":{\"id\":7,\"user_id\":2,\"total\":2.0}}]}");
+    check(!ok_code(r), "batch with duplicate pk fails");
+    JsonValue *rbv = json_obj_get(r, "rolled_back");
+    check(rbv && rbv->type == JSON_BOOL && rbv->boolean, "rolled_back flag set");
+    json_free(r);
+    r = run(&db, "{\"op\":\"select\",\"table\":\"orders\"}");
+    check(ok_code(r) && rows_of_result(r) == 6, "rollback keeps order count at 6");
+    json_free(r);
+
     printf("\n%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }
